@@ -409,7 +409,7 @@ static esp_err_t get_capabilities_handler(httpd_req_t *req) {
 #else
   httpd_resp_set_status(req, "200 OK");
   httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"version\": \"1.0\", \"flows\": [], \"current_flow\": \"none\"}");
+  httpd_resp_sendstr(req, "{\"version\": \"1.0\", \"dsp_enabled\": false, \"flows\": [], \"current_flow\": \"none\"}");
 #endif
   
   return ESP_OK;

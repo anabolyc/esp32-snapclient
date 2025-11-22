@@ -87,9 +87,9 @@
 <body>
   <nav class="nav-bar">
     <h1>ESP32 Snapclient</h1>
-    <ul class="nav-tabs">
+    <ul class="nav-tabs" id="nav-tabs">
       <li><a href="#" class="nav-link active" data-page="general-settings.html">General Settings</a></li>
-      <li><a href="#" class="nav-link" data-page="dsp-settings.html">DSP Settings</a></li>
+      <li id="dsp-tab" style="display: none;"><a href="#" class="nav-link" data-page="dsp-settings.html">DSP Settings</a></li>
     </ul>
   </nav>
 
@@ -100,10 +100,32 @@
   <script>
     'use strict';
 
+    // Check DSP capabilities and show/hide DSP tab
+    async function checkDSPAvailability() {
+      try {
+        const response = await getRequest('/capabilities');
+        const capabilities = await response.json();
+        
+        // Show DSP tab only if DSP is enabled
+        if (capabilities.dsp_enabled === true) {
+          const dspTab = document.getElementById('dsp-tab');
+          if (dspTab) {
+            dspTab.style.display = 'block';
+          }
+        }
+      } catch (error) {
+        console.error('Error checking DSP availability:', error);
+        // DSP tab remains hidden on error
+      }
+    }
+
     // Handle navigation
     document.addEventListener('DOMContentLoaded', function() {
       const navLinks = document.querySelectorAll('.nav-link');
       const contentFrame = document.getElementById('content-frame');
+
+      // Check if DSP is available
+      checkDSPAvailability();
 
       navLinks.forEach(link => {
         link.addEventListener('click', function(e) {

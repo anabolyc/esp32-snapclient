@@ -43,18 +43,8 @@ static float *sbufout0 = NULL;
 
 #if CONFIG_USE_DSP_PROCESSOR
 #define SNAPCAST_USE_SOFT_VOL CONFIG_SNAPCLIENT_USE_SOFT_VOL
-#if CONFIG_SNAPCLIENT_DSP_FLOW_STEREO
+// Default DSP flow is Stereo, but will be updated from NVS at runtime
 dspFlows_t dspFlowInit = dspfStereo;
-#endif
-#if CONFIG_SNAPCLIENT_DSP_FLOW_BASSBOOST
-dspFlows_t dspFlowInit = dspfBassBoost;
-#endif
-#if CONFIG_SNAPCLIENT_DSP_FLOW_BIAMP
-dspFlows_t dspFlowInit = dspfBiamp;
-#endif
-#if CONFIG_SNAPCLIENT_DSP_FLOW_BASS_TREBLE_EQ
-dspFlows_t dspFlowInit = dspfEQBassTreble;
-#endif
 #endif
 
 /**
@@ -761,6 +751,7 @@ char* dsp_processor_get_capabilities_json(void) {
   offset += snprintf(json + offset, buffer_size - offset,
     "{\n"
     "  \"version\": \"1.0\",\n"
+    "  \"dsp_enabled\": true,\n"
     "  \"flows\": [\n");
     
   // dspfStereo

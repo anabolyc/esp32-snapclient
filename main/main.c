@@ -110,21 +110,6 @@ SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
 
 SemaphoreHandle_t idCounterSemaphoreHandle = NULL;
 
-#if CONFIG_USE_DSP_PROCESSOR
-#if CONFIG_SNAPCLIENT_DSP_FLOW_STEREO
-dspFlows_t dspFlow = dspfStereo;
-#endif
-#if CONFIG_SNAPCLIENT_DSP_FLOW_BASSBOOST
-dspFlows_t dspFlow = dspfBassBoost;
-#endif
-#if CONFIG_SNAPCLIENT_DSP_FLOW_BIAMP
-dspFlows_t dspFlow = dspfBiamp;
-#endif
-#if CONFIG_SNAPCLIENT_DSP_FLOW_BASS_TREBLE_EQ
-dspFlows_t dspFlow = dspfEQBassTreble;
-#endif
-#endif
-
 typedef struct audioDACdata_s {
   bool mute;
   int volume;
@@ -2615,9 +2600,9 @@ void app_main(void) {
   // esp_log_level_set("i2s_common", ESP_LOG_DEBUG);
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("wifi_init", ESP_LOG_WARN);
-  esp_log_level_set("httpd_uri", ESP_LOG_DEBUG);
+  esp_log_level_set("httpd_uri", ESP_LOG_WARN);
   esp_log_level_set("HOSTNAME", ESP_LOG_DEBUG);
-  esp_log_level_set("UI_HTTP", ESP_LOG_DEBUG);
+  esp_log_level_set("UI_HTTP", ESP_LOG_WARN);
   esp_log_level_set("dspProc", ESP_LOG_DEBUG);
 
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
