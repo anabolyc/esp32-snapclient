@@ -1,6 +1,6 @@
 idf_component_register(SRCS "ui_http_server.c"
                        INCLUDE_DIRS "include"
-                       REQUIRES spiffs esp_http_server dsp_processor vfs nvs_flash hostname_manager)
+                       REQUIRES spiffs esp_http_server dsp_processor vfs nvs_flash settings_manager)
 
 # Create a SPIFFS image from the contents of the 'html' directory
 # that fits the partition named 'storage'. FLASH_IN_PROJECT indicates that

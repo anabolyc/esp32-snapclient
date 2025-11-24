@@ -74,9 +74,14 @@ async function getParameter(paramKey) {
   try {
     const response = await getRequest(`/get?param=${paramKey}`);
     const value = await response.text();
-    // Return as string for hostname, parse as float for numeric parameters
-    if (paramKey === 'hostname') {
+    // Return as string for hostname and snapserver_host
+    if (paramKey === 'hostname' || paramKey === 'snapserver_host') {
       return value.trim();
+    }
+    // For snapserver_port, handle empty string
+    if (paramKey === 'snapserver_port') {
+      const trimmed = value.trim();
+      return trimmed === '' ? '' : parseFloat(trimmed);
     }
     return parseFloat(value);
   } catch (error) {
@@ -97,6 +102,26 @@ async function setParameter(paramKey, value) {
     return true;
   } catch (error) {
     console.error(`Error setting parameter ${paramKey}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Delete a parameter from NVS (clear to default)
+ * @param {string} paramKey - Parameter key
+ * @returns {Promise<boolean>} True if successful
+ */
+async function deleteParameter(paramKey) {
+  try {
+    const response = await fetch(`/delete?param=${paramKey}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP error ${response.status}`);
+    }
+    return true;
+  } catch (error) {
+    console.error(`Error deleting parameter ${paramKey}:`, error);
     return false;
   }
 }

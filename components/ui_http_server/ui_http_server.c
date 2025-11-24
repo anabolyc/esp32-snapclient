@@ -23,7 +23,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "hostname_manager.h"
+#include "settings_manager.h"
 
 static const char *TAG = "UI_HTTP";
 
@@ -31,6 +31,10 @@ static QueueHandle_t xQueueHttp = NULL;
 static TaskHandle_t taskHandle = NULL;
 static httpd_handle_t server = NULL;
 static SemaphoreHandle_t nvs_mutex = NULL;
+
+/* Forward declarations for string NVS helpers */
+esp_err_t ui_http_save_str_param(const char *name, const char *value);
+esp_err_t ui_http_load_str_param(const char *name, char *out, size_t out_size);
 
 /**
  * List files in SPIFFS directory
@@ -204,7 +208,7 @@ static int find_key_value(char *key, char *parameter, char *value) {
  */
 static void set_cors_headers(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
   httpd_resp_set_hdr(req, "Access-Control-Max-Age", "86400");
 }
@@ -249,15 +253,58 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
       // URL decode the hostname value
       char decoded_hostname[64] = {0};
       url_decode(decoded_hostname, valstr, sizeof(decoded_hostname));
-      
+
       ESP_LOGI(TAG, "%s: Setting hostname to: %s", __func__, decoded_hostname);
-      
-      if (hostname_set(decoded_hostname) == ESP_OK) {
+
+  if (settings_set_hostname(decoded_hostname) == ESP_OK) {
         httpd_resp_set_status(req, "200 OK");
         httpd_resp_sendstr(req, "ok");
       } else {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_sendstr(req, "Invalid hostname");
+      }
+      return ESP_OK;
+    }
+
+    // Special handling for snapserver host (string parameter)
+    if (strcmp(param, "snapserver_host") == 0) {
+      char decoded_host[128] = {0};
+      url_decode(decoded_host, valstr, sizeof(decoded_host));
+      ESP_LOGI(TAG, "%s: Setting snapserver_host to: %s", __func__, decoded_host);
+  if (settings_set_server_host(decoded_host) == ESP_OK) {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_sendstr(req, "ok");
+      } else {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "error");
+      }
+      return ESP_OK;
+    }
+
+    // Special handling for snapserver_use_mdns (boolean/integer)
+    if (strcmp(param, "snapserver_use_mdns") == 0) {
+      long v = strtol(valstr, NULL, 10);
+      ESP_LOGI(TAG, "%s: Setting snapserver_use_mdns to: %ld", __func__, v);
+  if (settings_set_mdns_enabled(v != 0) == ESP_OK) {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_sendstr(req, "ok");
+      } else {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "error");
+      }
+      return ESP_OK;
+    }
+
+    // Special handling for snapserver_port (integer)
+    if (strcmp(param, "snapserver_port") == 0) {
+      long v = strtol(valstr, NULL, 10);
+      ESP_LOGI(TAG, "%s: Setting snapserver_port to: %ld", __func__, v);
+  if (settings_set_server_port((int32_t)v) == ESP_OK) {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_sendstr(req, "ok");
+      } else {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "error");
       }
       return ESP_OK;
     }
@@ -288,6 +335,81 @@ static esp_err_t root_post_handler(httpd_req_t *req) {
 }
 
 /*
+ * HTTP DELETE handler
+ * Clears a parameter from NVS: /delete?param=NAME
+ */
+static esp_err_t root_delete_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  char param[32] = {0};
+
+  set_cors_headers(req);
+
+  if (!find_key_value("param=", (char *)req->uri, param)) {
+    ESP_LOGD(TAG, "%s: Invalid delete: expected param=NAME in URI", __func__);
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_sendstr(req, "Missing param");
+    return ESP_OK;
+  }
+
+  // Handle hostname clear
+  if (strcmp(param, "hostname") == 0) {
+    ESP_LOGI(TAG, "%s: Clearing hostname from NVS", __func__);
+    if (settings_clear_hostname() == ESP_OK) {
+      httpd_resp_set_status(req, "200 OK");
+      httpd_resp_sendstr(req, "ok");
+    } else {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "error");
+    }
+    return ESP_OK;
+  }
+
+  // Handle snapserver_use_mdns clear
+  if (strcmp(param, "snapserver_use_mdns") == 0) {
+    ESP_LOGI(TAG, "%s: Clearing snapserver_use_mdns from NVS", __func__);
+    if (settings_clear_mdns_enabled() == ESP_OK) {
+      httpd_resp_set_status(req, "200 OK");
+      httpd_resp_sendstr(req, "ok");
+    } else {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "error");
+    }
+    return ESP_OK;
+  }
+
+  // Handle snapserver_host clear
+  if (strcmp(param, "snapserver_host") == 0) {
+    ESP_LOGI(TAG, "%s: Clearing snapserver_host from NVS", __func__);
+    if (settings_clear_server_host() == ESP_OK) {
+      httpd_resp_set_status(req, "200 OK");
+      httpd_resp_sendstr(req, "ok");
+    } else {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "error");
+    }
+    return ESP_OK;
+  }
+
+  // Handle snapserver_port clear
+  if (strcmp(param, "snapserver_port") == 0) {
+    ESP_LOGI(TAG, "%s: Clearing snapserver_port from NVS", __func__);
+    if (settings_clear_server_port() == ESP_OK) {
+      httpd_resp_set_status(req, "200 OK");
+      httpd_resp_sendstr(req, "ok");
+    } else {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "error");
+    }
+    return ESP_OK;
+  }
+
+  // Unknown parameter
+  httpd_resp_set_status(req, "400 Bad Request");
+  httpd_resp_sendstr(req, "Unknown parameter");
+  return ESP_OK;
+}
+
+/*
  * GET parameter handler
  * Returns current parameter value: /get?param=NAME
  * Response format: plain text integer value
@@ -304,7 +426,7 @@ static esp_err_t get_param_handler(httpd_req_t *req) {
     // Special handling for hostname (string parameter)
     if (strcmp(param, "hostname") == 0) {
       char hostname[64] = {0};
-      if (hostname_get(hostname, sizeof(hostname)) == ESP_OK) {
+  if (settings_get_hostname(hostname, sizeof(hostname)) == ESP_OK) {
         httpd_resp_set_status(req, "200 OK");
         httpd_resp_set_type(req, "text/plain");
         httpd_resp_sendstr(req, hostname);
@@ -312,6 +434,58 @@ static esp_err_t get_param_handler(httpd_req_t *req) {
       } else {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_sendstr(req, "error");
+      }
+      return ESP_OK;
+    }
+
+    if (strcmp(param, "snapserver_use_mdns") == 0) {
+      bool enabled = true;
+  if (settings_get_mdns_enabled(&enabled) == ESP_OK) {
+        char resp[8];
+        snprintf(resp, sizeof(resp), "%d", enabled ? 1 : 0);
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, resp);
+        ESP_LOGD(TAG, "%s: snapserver_use_mdns=%d", __func__, enabled ? 1 : 0);
+      } else {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "1");
+        ESP_LOGD(TAG, "%s: snapserver_use_mdns not found, returning default 1", __func__);
+      }
+      return ESP_OK;
+    }
+
+    if (strcmp(param, "snapserver_host") == 0) {
+      char host[128] = {0};
+  if (settings_get_server_host(host, sizeof(host)) == ESP_OK) {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, host);
+        ESP_LOGD(TAG, "%s: snapserver_host=%s", __func__, host);
+      } else {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "");
+        ESP_LOGD(TAG, "%s: snapserver_host not found, returning empty", __func__);
+      }
+      return ESP_OK;
+    }
+
+    if (strcmp(param, "snapserver_port") == 0) {
+      int32_t port = 0;
+  if (settings_get_server_port(&port) == ESP_OK && port != 0) {
+        char resp[16];
+        snprintf(resp, sizeof(resp), "%d", (int)port);
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, resp);
+        ESP_LOGD(TAG, "%s: snapserver_port=%d", __func__, (int)port);
+      } else {
+        httpd_resp_set_status(req, "200 OK");
+        httpd_resp_set_type(req, "text/plain");
+        httpd_resp_sendstr(req, "");
+        ESP_LOGD(TAG, "%s: snapserver_port not found, returning empty", __func__);
       }
       return ESP_OK;
     }
@@ -602,6 +776,96 @@ esp_err_t ui_http_load_param(const char *name, int32_t *value) {
   return err;
 }
 
+/**
+ * Save a string parameter to NVS under namespace "ui_http".
+ * Thread-safe with mutex protection.
+ */
+esp_err_t ui_http_save_str_param(const char *name, const char *value) {
+  ESP_LOGD(TAG, "%s: name=%s value=%s", __func__, name, value ? value : "(null)");
+
+  if (!nvs_mutex) {
+    ESP_LOGE(TAG, "%s: NVS mutex not initialized", __func__);
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    ESP_LOGE(TAG, "%s: Failed to acquire NVS mutex (timeout)", __func__);
+    return ESP_ERR_TIMEOUT;
+  }
+
+  nvs_handle_t h;
+  esp_err_t err = nvs_open("ui_http", NVS_READWRITE, &h);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "%s: nvs_open failed: %s", __func__, esp_err_to_name(err));
+    xSemaphoreGive(nvs_mutex);
+    return err;
+  }
+
+  if (value == NULL) {
+    // Remove key
+    err = nvs_erase_key(h, name);
+  } else {
+    err = nvs_set_str(h, name, value);
+    if (err == ESP_OK) err = nvs_commit(h);
+  }
+
+  nvs_close(h);
+  xSemaphoreGive(nvs_mutex);
+
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to save str param '%s': %s", __func__, name, esp_err_to_name(err));
+  }
+  return err;
+}
+
+/**
+ * Load a string parameter from NVS. Caller must provide buffer and size.
+ * Returns ESP_OK on success or ESP_ERR_NVS_NOT_FOUND if not present.
+ * Thread-safe with mutex protection.
+ */
+esp_err_t ui_http_load_str_param(const char *name, char *out, size_t out_size) {
+  ESP_LOGD(TAG, "%s: name=%s", __func__, name);
+
+  if (!nvs_mutex) {
+    ESP_LOGE(TAG, "%s: NVS mutex not initialized", __func__);
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    ESP_LOGE(TAG, "%s: Failed to acquire NVS mutex (timeout)", __func__);
+    return ESP_ERR_TIMEOUT;
+  }
+
+  nvs_handle_t h;
+  esp_err_t err = nvs_open("ui_http", NVS_READWRITE, &h);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "%s: nvs_open failed: %s", __func__, esp_err_to_name(err));
+    xSemaphoreGive(nvs_mutex);
+    return err;
+  }
+
+  size_t required_size = 0;
+  err = nvs_get_str(h, name, NULL, &required_size);
+  if (err == ESP_OK && required_size > 0 && out != NULL && out_size > 0) {
+    if (required_size > out_size) {
+      // not enough room
+      ESP_LOGW(TAG, "%s: buffer too small (%d needed, have %d)", __func__, (int)required_size, (int)out_size);
+      nvs_close(h);
+      xSemaphoreGive(nvs_mutex);
+      return ESP_ERR_INVALID_ARG;
+    }
+    err = nvs_get_str(h, name, out, &out_size);
+  }
+
+  nvs_close(h);
+  xSemaphoreGive(nvs_mutex);
+
+  if (err != ESP_OK) {
+    ESP_LOGD(TAG, "%s: nvs_get_str('%s') -> %s", __func__, name, esp_err_to_name(err));
+  }
+  return err;
+}
+
 /*
  * Function to start the web server
  */
@@ -636,6 +900,12 @@ esp_err_t start_server(const char *base_path, int port) {
   };
   httpd_register_uri_handler(server, &_root_post_handler);
 
+  /* URI handler for delete */
+  httpd_uri_t _root_delete_handler = {
+      .uri = "/delete", .method = HTTP_DELETE, .handler = root_delete_handler,
+  };
+  httpd_register_uri_handler(server, &_root_delete_handler);
+
   /* URI handler for get parameter */
   httpd_uri_t _get_param_handler = {
       .uri = "/get", .method = HTTP_GET, .handler = get_param_handler,
@@ -666,6 +936,11 @@ esp_err_t start_server(const char *base_path, int port) {
   };
   httpd_register_uri_handler(server, &_options_get_handler);
 
+  httpd_uri_t _options_delete_handler = {
+      .uri = "/delete", .method = HTTP_OPTIONS, .handler = options_handler,
+  };
+  httpd_register_uri_handler(server, &_options_delete_handler);
+
   httpd_uri_t _options_capabilities_handler = {
       .uri = "/capabilities", .method = HTTP_OPTIONS, .handler = options_handler,
   };
@@ -692,6 +967,12 @@ static void http_server_task(void *pvParameters) {
   ESP_LOGD(TAG, "%s: started", __func__);
   // Start Server
   ESP_ERROR_CHECK(start_server("/html", CONFIG_WEB_PORT));
+
+  // Ensure mdns setting has a default (true) on first boot - handled by settings_manager
+  bool tmp_mdns = true;
+  if (settings_get_mdns_enabled(&tmp_mdns) == ESP_OK) {
+    ESP_LOGD(TAG, "%s: mdns setting loaded: %d", __func__, tmp_mdns ? 1 : 0);
+  }
 
   // Load last active flow from NVS
   int32_t tmpv = 0;
