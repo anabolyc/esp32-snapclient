@@ -841,71 +841,18 @@ static void http_server_task(void *pvParameters) {
     ESP_LOGD(TAG, "%s: mdns setting loaded: %d", __func__, tmp_mdns ? 1 : 0);
   }
 
-  // Load last active flow from NVS
+  // DSP processor already loads parameters from NVS in dsp_processor_init()
+  // Just get the current active flow and parameters from DSP processor
   dspFlows_t active_flow = dspfEQBassTreble;  // default
-  if (dsp_settings_load_active_flow(&active_flow) == ESP_OK) {
-    ESP_LOGI(TAG, "%s: Loaded active flow: %d", __func__, active_flow);
-  }
-
-  // Load persisted parameters for all flows from NVS
-  for (int flow = 0; flow < 6; flow++) {
-    filterParams_t params;
-    // Initialize all fields to zero
-    memset(&params, 0, sizeof(filterParams_t));
-    params.dspFlow = (dspFlows_t)flow;
-    
-    // Initialize with defaults from DSP processor
-#if CONFIG_USE_DSP_PROCESSOR
-    dsp_processor_get_params_for_flow((dspFlows_t)flow, &params);
-#endif
-    
-    // Try to load persisted values using dsp_settings
-    int32_t tmp_val = 0;
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_1", &tmp_val) == ESP_OK) {
-      params.fc_1 = (float)tmp_val;
-    }
-    
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_1", &tmp_val) == ESP_OK) {
-      params.gain_1 = (float)tmp_val;
-    }
-    
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_2", &tmp_val) == ESP_OK) {
-      params.fc_2 = (float)tmp_val;
-    }
-    
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_2", &tmp_val) == ESP_OK) {
-      params.gain_2 = (float)tmp_val;
-    }
-    
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_3", &tmp_val) == ESP_OK) {
-      params.fc_3 = (float)tmp_val;
-    }
-    
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_3", &tmp_val) == ESP_OK) {
-      params.gain_3 = (float)tmp_val;
-    }
-    
-    // Store in DSP processor's centralized storage
-#if CONFIG_USE_DSP_PROCESSOR
-    dsp_processor_set_params_for_flow((dspFlows_t)flow, &params);
-#endif
-    
-    ESP_LOGI(TAG, "%s: Loaded flow %d: fc_1=%.1f gain_1=%.1f fc_3=%.1f gain_3=%.1f", 
-             __func__, flow, params.fc_1, params.gain_1, params.fc_3, params.gain_3);
-  }
-
-#if CONFIG_USE_DSP_PROCESSOR
-  // Switch to the active flow (this applies its parameters)
-  dsp_processor_switch_flow(active_flow);
-  ESP_LOGI(TAG, "%s: Switched to flow %d", __func__, active_flow);
-#endif
-
-  // Get current active parameters
   filterParams_t current_params;
-#if CONFIG_USE_DSP_PROCESSOR
-  dsp_processor_get_params_for_flow(active_flow, &current_params);
-#else
   memset(&current_params, 0, sizeof(filterParams_t));
+  
+#if CONFIG_USE_DSP_PROCESSOR
+  active_flow = dsp_processor_get_current_flow();
+  dsp_processor_get_params_for_flow(active_flow, &current_params);
+  ESP_LOGI(TAG, "%s: Current flow %d with fc_1=%.1f gain_1=%.1f", 
+           __func__, active_flow, current_params.fc_1, current_params.gain_1);
+#else
   current_params.dspFlow = active_flow;
 #endif
 

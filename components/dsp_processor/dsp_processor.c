@@ -30,9 +30,6 @@ static QueueHandle_t filterUpdateQHdl = NULL;
 // Centralized parameter storage - one set of parameters per DSP flow
 static dsp_all_params_t all_params;
 
-// Legacy single filterParams for backward compatibility with worker thread
-static filterParams_t filterParams;
-
 static ptype_t *filter = NULL;
 
 static double dynamic_vol = 1.0;
@@ -124,15 +121,6 @@ void dsp_processor_init(void) {
     ESP_LOGI(TAG, "%s: Restored active flow: %d", __func__, saved_flow);
   }
 
-  // Initialize legacy filterParams from active flow
-  filterParams.dspFlow = all_params.active_flow;
-  filterParams.fc_1 = all_params.flow_params[all_params.active_flow].fc_1;
-  filterParams.gain_1 = all_params.flow_params[all_params.active_flow].gain_1;
-  filterParams.fc_2 = all_params.flow_params[all_params.active_flow].fc_2;
-  filterParams.gain_2 = all_params.flow_params[all_params.active_flow].gain_2;
-  filterParams.fc_3 = all_params.flow_params[all_params.active_flow].fc_3;
-  filterParams.gain_3 = all_params.flow_params[all_params.active_flow].gain_3;
-
   ESP_LOGI(TAG, "%s: Initialized with flow=%d, fc_1=%.1f, gain_1=%.1f", __func__,
            all_params.active_flow, 
            all_params.flow_params[all_params.active_flow].fc_1,
@@ -173,15 +161,12 @@ void dsp_processor_uninit(void) {
 
 /**
  * Update filter parameters
- * Updates both the static filterParams immediately and queues for worker thread
+ * Updates centralized storage and queues for worker thread
  */
 esp_err_t dsp_processor_update_filter_params(filterParams_t *params) {
   ESP_LOGD(TAG, "%s: updating filter params", __func__);
   
-  // Update static filterParams immediately so get_capabilities returns current value
-  memcpy(&filterParams, params, sizeof(filterParams_t));
-  
-  // Also update centralized storage for the current flow
+  // Update centralized storage for the current flow
   dspFlows_t flow = params->dspFlow;
   if (flow >= 0 && flow < 6) {  // Validate flow index
     all_params.active_flow = flow;
@@ -193,6 +178,7 @@ esp_err_t dsp_processor_update_filter_params(filterParams_t *params) {
     all_params.flow_params[flow].gain_3 = params->gain_3;
   }
   
+  // Queue for worker thread to apply changes
   if (filterUpdateQHdl) {
     if (xQueueOverwrite(filterUpdateQHdl, params) == pdTRUE) {
       return ESP_OK;
@@ -273,17 +259,31 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
   // volatile needed to ensure 32 bit access
   volatile uint32_t *audio_tmp =
       (volatile uint32_t *)(pcmChnk->fragment->payload);
-  dspFlows_t dspFlow;
-
-  // check if we need to update filters
-  if (xQueueReceive(filterUpdateQHdl, &filterParams, pdMS_TO_TICKS(0)) ==
-      pdTRUE) {
-    init = false;
-
-    // TODO: store filterParams in NVM
+  
+  // Local working copy of filter parameters
+  static filterParams_t currentFilterParams = {0};
+  static bool paramsInitialized = false;
+  
+  // Initialize on first run
+  if (!paramsInitialized) {
+    currentFilterParams.dspFlow = all_params.active_flow;
+    currentFilterParams.fc_1 = all_params.flow_params[all_params.active_flow].fc_1;
+    currentFilterParams.gain_1 = all_params.flow_params[all_params.active_flow].gain_1;
+    currentFilterParams.fc_2 = all_params.flow_params[all_params.active_flow].fc_2;
+    currentFilterParams.gain_2 = all_params.flow_params[all_params.active_flow].gain_2;
+    currentFilterParams.fc_3 = all_params.flow_params[all_params.active_flow].fc_3;
+    currentFilterParams.gain_3 = all_params.flow_params[all_params.active_flow].gain_3;
+    paramsInitialized = true;
   }
 
-  dspFlow = filterParams.dspFlow;
+  // Check if we need to update filters from queue
+  filterParams_t newParams;
+  if (xQueueReceive(filterUpdateQHdl, &newParams, pdMS_TO_TICKS(0)) == pdTRUE) {
+    currentFilterParams = newParams;
+    init = false;
+  }
+
+  dspFlows_t dspFlow = currentFilterParams.dspFlow;
 
   if (init == false) {
     uint32_t cnt = 0;
@@ -301,10 +301,10 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
             (ptype_t *)heap_caps_malloc(sizeof(ptype_t) * cnt, MALLOC_CAP_8BIT);
         if (filter) {
           // simple EQ control of low and high frequencies (bass, treble)
-          float bass_fc = filterParams.fc_1 / samplerate;
-          float bass_gain = filterParams.gain_1;
-          float treble_fc = filterParams.fc_3 / samplerate;
-          float treble_gain = filterParams.gain_3;
+          float bass_fc = currentFilterParams.fc_1 / samplerate;
+          float bass_gain = currentFilterParams.gain_1;
+          float treble_fc = currentFilterParams.fc_3 / samplerate;
+          float treble_gain = currentFilterParams.gain_3;
 
           // filters for CH 0
           filter[0] = (ptype_t){LOWSHELF, bass_fc, bass_gain,       0.707,
@@ -336,8 +336,8 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
         filter =
             (ptype_t *)heap_caps_malloc(sizeof(ptype_t) * cnt, MALLOC_CAP_8BIT);
         if (filter) {
-          float bass_fc = filterParams.fc_1 / samplerate;
-          float bass_gain = filterParams.gain_1;
+          float bass_fc = currentFilterParams.fc_1 / samplerate;
+          float bass_gain = currentFilterParams.gain_1;
 
           filter[0] = (ptype_t){LOWSHELF, bass_fc, bass_gain,       0.707,
                                 NULL,     NULL,    {0, 0, 0, 0, 0}, {0, 0}};
@@ -345,7 +345,7 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
                                 NULL,     NULL,    {0, 0, 0, 0, 0}, {0, 0}};
 
           ESP_LOGI(TAG, "got new setting for dspfBassBoost: fc=%.1f gain=%.1f", 
-                   filterParams.fc_1, filterParams.gain_1);
+                   currentFilterParams.fc_1, currentFilterParams.gain_1);
         } else {
           ESP_LOGE(TAG, "failed to get memory for filter");
         }
@@ -359,10 +359,10 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
         filter =
             (ptype_t *)heap_caps_malloc(sizeof(ptype_t) * cnt, MALLOC_CAP_8BIT);
         if (filter) {
-          float lp_fc = filterParams.fc_1 / samplerate;
-          float lp_gain = filterParams.gain_1;
-          float hp_fc = filterParams.fc_3 / samplerate;
-          float hp_gain = filterParams.gain_3;
+          float lp_fc = currentFilterParams.fc_1 / samplerate;
+          float lp_gain = currentFilterParams.gain_1;
+          float hp_fc = currentFilterParams.fc_3 / samplerate;
+          float hp_gain = currentFilterParams.gain_3;
 
           filter[0] = (ptype_t){LPF,  lp_fc, lp_gain,         0.707,
                                 NULL, NULL,  {0, 0, 0, 0, 0}, {0, 0}};
@@ -761,8 +761,8 @@ void dsp_processor_set_volome(double volume) {
  * Get current DSP flow
  */
 dspFlows_t dsp_processor_get_current_flow(void) {
-  ESP_LOGD(TAG, "%s: returning flow=%d", __func__, filterParams.dspFlow);
-  return filterParams.dspFlow;
+  ESP_LOGD(TAG, "%s: returning flow=%d", __func__, all_params.active_flow);
+  return all_params.active_flow;
 }
 
 /**
