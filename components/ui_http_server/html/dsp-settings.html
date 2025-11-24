@@ -155,20 +155,24 @@
     let capabilities = null;
     let currentFlow = null;
 
-    // Fetch DSP capabilities from the device
+    // Fetch DSP settings from the device
     async function loadCapabilities() {
       try {
-        const response = await getRequest('/capabilities');
+        const response = await getRequest('/capabilities?tab=dsp');
         if (!response.ok) {
-          throw new Error('Failed to fetch capabilities');
+          throw new Error('Failed to fetch DSP settings');
         }
         capabilities = await response.json();
-        currentFlow = capabilities.current_flow;
+        
+        // Map active_flow number to flow ID
+        const flowMap = ['dspfStereo', 'dspfBiamp', 'dspf2DOT1', 'dspfFunkyHonda', 'dspfBassBoost', 'dspfEQBassTreble'];
+        currentFlow = flowMap[capabilities.active_flow] || 'dspfEQBassTreble';
+        
         renderUI();
       } catch (error) {
-        console.error('Error loading capabilities:', error);
+        console.error('Error loading DSP settings:', error);
         document.getElementById('app').innerHTML = 
-          '<div class="error">Error loading DSP capabilities. Please refresh the page.</div>';
+          '<div class="error">Error loading DSP settings. Please refresh the page.</div>';
       }
     }
 
@@ -202,11 +206,11 @@
       app.innerHTML = html;
 
       // Render parameters for current flow
-      await renderParameters();
+      renderParameters();
     }
 
     // Render parameters for the currently selected flow
-    async function renderParameters() {
+    function renderParameters() {
       const container = document.getElementById('parameters');
       const selectedFlow = capabilities.flows.find(f => f.id === currentFlow);
       
@@ -219,8 +223,7 @@
 
       // Create controls for each parameter
       for (const param of selectedFlow.parameters) {
-        const currentValue = await getParameter(param.key);
-        const value = currentValue !== null ? currentValue : param.default;
+        const value = param.current !== undefined ? param.current : param.default;
         
         const controlDiv = document.createElement('div');
         controlDiv.className = 'parameter-control';
@@ -230,21 +233,19 @@
         html += `<span class="param-value" id="${param.key}-value">${value.toFixed(1)} ${param.unit}</span>`;
         html += '</div>';
         
-        if (param.ui_control === 'slider') {
-          const step = param.step || 1;
-          html += `<input type="range" 
-                    id="${param.key}" 
-                    min="${param.min}" 
-                    max="${param.max}" 
-                    step="${step}" 
-                    value="${value}"
-                    oninput="handleParameterChange('${param.key}', this.value, '${param.unit}')"
-                    aria-label="${param.name}">`;
-          html += '<div class="range-labels">';
-          html += `<span>${param.min} ${param.unit}</span>`;
-          html += `<span>${param.max} ${param.unit}</span>`;
-          html += '</div>';
-        }
+        const step = param.step || 1;
+        html += `<input type="range" 
+                  id="${param.key}" 
+                  min="${param.min}" 
+                  max="${param.max}" 
+                  step="${step}" 
+                  value="${value}"
+                  oninput="handleParameterChange('${param.key}', this.value, '${param.unit}')"
+                  aria-label="${param.name}">`;
+        html += '<div class="range-labels">';
+        html += `<span>${param.min} ${param.unit}</span>`;
+        html += `<span>${param.max} ${param.unit}</span>`;
+        html += '</div>';
         
         controlDiv.innerHTML = html;
         container.appendChild(controlDiv);
@@ -280,23 +281,13 @@
         flowSelector.appendChild(descDiv);
       }
 
-      // Map flow ID to enum value
-      const flowEnumMap = {
-        'dspfStereo': 0,
-        'dspfBiamp': 1,
-        'dspf2DOT1': 2,
-        'dspfFunkyHonda': 3,
-        'dspfBassBoost': 4,
-        'dspfEQBassTreble': 5
-      };
-      
-      const flowValue = flowEnumMap[newFlowId];
-      if (flowValue !== undefined) {
-        await setParameter('dspFlow', flowValue);
+      // Use enum_value from the flow object
+      if (selectedFlow && selectedFlow.enum_value !== undefined) {
+        await setParameter('dspFlow', selectedFlow.enum_value);
       }
       
       // Re-render parameters for new flow
-      await renderParameters();
+      renderParameters();
     }
 
     // Initialize on page load

@@ -18,23 +18,18 @@
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "esp_vfs.h"
-#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "settings_manager.h"
+#include "dsp_processor_settings.h"
 
 static const char *TAG = "UI_HTTP";
 
 static QueueHandle_t xQueueHttp = NULL;
 static TaskHandle_t taskHandle = NULL;
 static httpd_handle_t server = NULL;
-static SemaphoreHandle_t nvs_mutex = NULL;
-
-/* Forward declarations for string NVS helpers */
-esp_err_t ui_http_save_str_param(const char *name, const char *value);
-esp_err_t ui_http_load_str_param(const char *name, char *out, size_t out_size);
 
 /**
  * List files in SPIFFS directory
@@ -50,15 +45,6 @@ static void SPIFFS_Directory(char *path) {
              pe->d_ino, pe->d_type);
   }
   closedir(dir);
-}
-
-/**
- * Helper: Generate flow-specific NVS key
- * Format: "flow_<id>_<param>" (e.g., "flow_5_fc_1" for dspfEQBassTreble bass freq)
- * This prevents parameter collisions between different DSP flows
- */
-static void make_flow_key(char *out_key, size_t out_size, dspFlows_t flow, const char *param) {
-  snprintf(out_key, out_size, "flow_%d_%s", (int)flow, param);
 }
 
 /**
@@ -529,28 +515,24 @@ static esp_err_t get_param_handler(httpd_req_t *req) {
       httpd_resp_sendstr(req, "0");
     }
 #else
-    // Fallback: load from NVS with flow-specific key
-    int32_t active_flow_val = 0;
+    // Fallback: load from NVS using dsp_settings
     dspFlows_t current_flow = dspfEQBassTreble;
-    if (ui_http_load_param("active_flow", &active_flow_val) == ESP_OK) {
-      current_flow = (dspFlows_t)active_flow_val;
+    if (dsp_settings_load_active_flow(&current_flow) != ESP_OK) {
+      current_flow = dspfEQBassTreble;  // default
     }
     
-    char flow_key[32];
-    make_flow_key(flow_key, sizeof(flow_key), current_flow, param);
-    
     int32_t value = 0;
-    if (ui_http_load_param(flow_key, &value) == ESP_OK) {
+    if (dsp_settings_load_flow_param(current_flow, param, &value) == ESP_OK) {
       char response[32];
       snprintf(response, sizeof(response), "%d", (int)value);
       httpd_resp_set_status(req, "200 OK");
       httpd_resp_set_type(req, "text/plain");
       httpd_resp_sendstr(req, response);
-      ESP_LOGD(TAG, "%s: %s=%d", __func__, flow_key, (int)value);
+      ESP_LOGD(TAG, "%s: flow=%d %s=%d", __func__, current_flow, param, (int)value);
     } else {
       httpd_resp_set_status(req, "404 Not Found");
       httpd_resp_sendstr(req, "0");
-      ESP_LOGD(TAG, "%s: %s not found, returning 0", __func__, flow_key);
+      ESP_LOGD(TAG, "%s: flow=%d %s not found, returning 0", __func__, current_flow, param);
     }
 #endif
   } else {
@@ -562,29 +544,85 @@ static esp_err_t get_param_handler(httpd_req_t *req) {
 
 /*
  * GET capabilities handler
- * Returns DSP capabilities as JSON: /capabilities
+ * Returns settings based on the 'tab' parameter: /capabilities?tab=general or /capabilities?tab=dsp
+ * 
+ * Response for tab=general:
+ * - hostname, mdns_enabled, server_host, server_port
+ * 
+ * Response for tab=dsp (if DSP enabled):
+ * - active_flow and all flow parameters
  */
 static esp_err_t get_capabilities_handler(httpd_req_t *req) {
   ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
   
   set_cors_headers(req);
   
-#if CONFIG_USE_DSP_PROCESSOR
-  char* capabilities_json = dsp_processor_get_capabilities_json();
-  if (capabilities_json) {
+  // Parse tab parameter
+  char tab[16] = {0};
+  if (!find_key_value("tab=", (char *)req->uri, tab)) {
+    // No tab specified, return error
+    ESP_LOGW(TAG, "%s: Missing 'tab' parameter", __func__);
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_sendstr(req, "{\"error\": \"Missing 'tab' parameter. Use ?tab=general or ?tab=dsp\"}");
+    return ESP_OK;
+  }
+  
+  ESP_LOGI(TAG, "%s: Requested tab: %s", __func__, tab);
+  
+  if (strcmp(tab, "general") == 0) {
+    // Return general settings
+    char general_json[512] = {0};
+    esp_err_t ret = settings_get_json(general_json, sizeof(general_json));
+    
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "%s: Failed to get general settings JSON: %s", __func__, esp_err_to_name(ret));
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "{\"error\": \"Failed to retrieve general settings\"}");
+      return ESP_OK;
+    }
+    
     httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, capabilities_json);
-    free(capabilities_json);
-  } else {
-    httpd_resp_set_status(req, "500 Internal Server Error");
-    httpd_resp_sendstr(req, "{\"error\": \"Failed to generate capabilities\"}");
-  }
+    httpd_resp_sendstr(req, general_json);
+    
+  } else if (strcmp(tab, "dsp") == 0) {
+#if CONFIG_USE_DSP_PROCESSOR
+    // Return DSP settings - allocate larger buffer for schema + values
+    char *dsp_json = (char *)malloc(4096);
+    if (!dsp_json) {
+      ESP_LOGE(TAG, "%s: Failed to allocate memory for DSP JSON", __func__);
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+      return ESP_OK;
+    }
+    
+    esp_err_t ret = dsp_settings_get_json(dsp_json, 4096);
+    
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "%s: Failed to get DSP settings JSON: %s", __func__, esp_err_to_name(ret));
+      free(dsp_json);
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "{\"error\": \"Failed to retrieve DSP settings\"}");
+      return ESP_OK;
+    }
+    
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, dsp_json);
+    free(dsp_json);
 #else
-  httpd_resp_set_status(req, "200 OK");
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"version\": \"1.0\", \"dsp_enabled\": false, \"flows\": [], \"current_flow\": \"none\"}");
+    // DSP not enabled
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"dsp_enabled\": false}");
 #endif
+    
+  } else {
+    // Unknown tab
+    ESP_LOGW(TAG, "%s: Unknown tab: %s", __func__, tab);
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_sendstr(req, "{\"error\": \"Unknown tab. Use ?tab=general or ?tab=dsp\"}");
+  }
   
   return ESP_OK;
 }
@@ -693,177 +731,6 @@ esp_err_t stop_server(void) {
   }
 
   return ESP_OK;
-}
-
-/**
- * Save a single integer parameter to NVS under namespace "ui_http".
- * Thread-safe with mutex protection.
- */
-esp_err_t ui_http_save_param(const char *name, int32_t value) {
-  ESP_LOGD(TAG, "%s: name=%s value=%d", __func__, name, (int)value);
-  
-  if (!nvs_mutex) {
-    ESP_LOGE(TAG, "%s: NVS mutex not initialized", __func__);
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  // Acquire mutex with timeout to prevent deadlock
-  if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    ESP_LOGE(TAG, "%s: Failed to acquire NVS mutex (timeout)", __func__);
-    return ESP_ERR_TIMEOUT;
-  }
-
-  nvs_handle_t h;
-  esp_err_t err = nvs_open("ui_http", NVS_READWRITE, &h);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "%s: nvs_open failed: %s", __func__, esp_err_to_name(err));
-    xSemaphoreGive(nvs_mutex);
-    return err;
-  }
-
-  err = nvs_set_i32(h, name, value);
-  if (err == ESP_OK) {
-    err = nvs_commit(h);
-  }
-  nvs_close(h);
-  
-  xSemaphoreGive(nvs_mutex);
-  
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "%s: Failed to save param '%s': %s", __func__, name, esp_err_to_name(err));
-  }
-  return err;
-}
-
-/**
- * Load a single integer parameter from NVS. Returns ESP_OK on success or
- * ESP_ERR_NVS_NOT_FOUND if not present.
- * Thread-safe with mutex protection.
- */
-esp_err_t ui_http_load_param(const char *name, int32_t *value) {
-  ESP_LOGD(TAG, "%s: name=%s", __func__, name);
-  
-  if (!nvs_mutex) {
-    ESP_LOGE(TAG, "%s: NVS mutex not initialized", __func__);
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  // Acquire mutex with timeout to prevent deadlock
-  if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    ESP_LOGE(TAG, "%s: Failed to acquire NVS mutex (timeout)", __func__);
-    return ESP_ERR_TIMEOUT;
-  }
-
-  nvs_handle_t h;
-  esp_err_t err = nvs_open("ui_http", NVS_READWRITE, &h);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "%s: nvs_open failed: %s", __func__, esp_err_to_name(err));
-    xSemaphoreGive(nvs_mutex);
-    return err;
-  }
-
-  int32_t tmp = 0;
-  err = nvs_get_i32(h, name, &tmp);
-  nvs_close(h);
-  
-  xSemaphoreGive(nvs_mutex);
-  
-  if (err == ESP_OK) {
-    *value = tmp;
-  } else {
-    ESP_LOGD(TAG, "%s: nvs_get_i32('%s') -> %s", __func__, name, esp_err_to_name(err));
-  }
-  return err;
-}
-
-/**
- * Save a string parameter to NVS under namespace "ui_http".
- * Thread-safe with mutex protection.
- */
-esp_err_t ui_http_save_str_param(const char *name, const char *value) {
-  ESP_LOGD(TAG, "%s: name=%s value=%s", __func__, name, value ? value : "(null)");
-
-  if (!nvs_mutex) {
-    ESP_LOGE(TAG, "%s: NVS mutex not initialized", __func__);
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    ESP_LOGE(TAG, "%s: Failed to acquire NVS mutex (timeout)", __func__);
-    return ESP_ERR_TIMEOUT;
-  }
-
-  nvs_handle_t h;
-  esp_err_t err = nvs_open("ui_http", NVS_READWRITE, &h);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "%s: nvs_open failed: %s", __func__, esp_err_to_name(err));
-    xSemaphoreGive(nvs_mutex);
-    return err;
-  }
-
-  if (value == NULL) {
-    // Remove key
-    err = nvs_erase_key(h, name);
-  } else {
-    err = nvs_set_str(h, name, value);
-    if (err == ESP_OK) err = nvs_commit(h);
-  }
-
-  nvs_close(h);
-  xSemaphoreGive(nvs_mutex);
-
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "%s: Failed to save str param '%s': %s", __func__, name, esp_err_to_name(err));
-  }
-  return err;
-}
-
-/**
- * Load a string parameter from NVS. Caller must provide buffer and size.
- * Returns ESP_OK on success or ESP_ERR_NVS_NOT_FOUND if not present.
- * Thread-safe with mutex protection.
- */
-esp_err_t ui_http_load_str_param(const char *name, char *out, size_t out_size) {
-  ESP_LOGD(TAG, "%s: name=%s", __func__, name);
-
-  if (!nvs_mutex) {
-    ESP_LOGE(TAG, "%s: NVS mutex not initialized", __func__);
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    ESP_LOGE(TAG, "%s: Failed to acquire NVS mutex (timeout)", __func__);
-    return ESP_ERR_TIMEOUT;
-  }
-
-  nvs_handle_t h;
-  esp_err_t err = nvs_open("ui_http", NVS_READWRITE, &h);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "%s: nvs_open failed: %s", __func__, esp_err_to_name(err));
-    xSemaphoreGive(nvs_mutex);
-    return err;
-  }
-
-  size_t required_size = 0;
-  err = nvs_get_str(h, name, NULL, &required_size);
-  if (err == ESP_OK && required_size > 0 && out != NULL && out_size > 0) {
-    if (required_size > out_size) {
-      // not enough room
-      ESP_LOGW(TAG, "%s: buffer too small (%d needed, have %d)", __func__, (int)required_size, (int)out_size);
-      nvs_close(h);
-      xSemaphoreGive(nvs_mutex);
-      return ESP_ERR_INVALID_ARG;
-    }
-    err = nvs_get_str(h, name, out, &out_size);
-  }
-
-  nvs_close(h);
-  xSemaphoreGive(nvs_mutex);
-
-  if (err != ESP_OK) {
-    ESP_LOGD(TAG, "%s: nvs_get_str('%s') -> %s", __func__, name, esp_err_to_name(err));
-  }
-  return err;
 }
 
 /*
@@ -975,15 +842,12 @@ static void http_server_task(void *pvParameters) {
   }
 
   // Load last active flow from NVS
-  int32_t tmpv = 0;
   dspFlows_t active_flow = dspfEQBassTreble;  // default
-  if (ui_http_load_param("active_flow", &tmpv) == ESP_OK) {
-    active_flow = (dspFlows_t)tmpv;
+  if (dsp_settings_load_active_flow(&active_flow) == ESP_OK) {
     ESP_LOGI(TAG, "%s: Loaded active flow: %d", __func__, active_flow);
   }
 
   // Load persisted parameters for all flows from NVS
-  char key[32];
   for (int flow = 0; flow < 6; flow++) {
     filterParams_t params;
     // Initialize all fields to zero
@@ -995,35 +859,30 @@ static void http_server_task(void *pvParameters) {
     dsp_processor_get_params_for_flow((dspFlows_t)flow, &params);
 #endif
     
-    // Try to load persisted values (flow-specific keys)
-    make_flow_key(key, sizeof(key), (dspFlows_t)flow, "fc_1");
-    if (ui_http_load_param(key, &tmpv) == ESP_OK) {
-      params.fc_1 = (float)tmpv;
+    // Try to load persisted values using dsp_settings
+    int32_t tmp_val = 0;
+    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_1", &tmp_val) == ESP_OK) {
+      params.fc_1 = (float)tmp_val;
     }
     
-    make_flow_key(key, sizeof(key), (dspFlows_t)flow, "gain_1");
-    if (ui_http_load_param(key, &tmpv) == ESP_OK) {
-      params.gain_1 = (float)tmpv;
+    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_1", &tmp_val) == ESP_OK) {
+      params.gain_1 = (float)tmp_val;
     }
     
-    make_flow_key(key, sizeof(key), (dspFlows_t)flow, "fc_2");
-    if (ui_http_load_param(key, &tmpv) == ESP_OK) {
-      params.fc_2 = (float)tmpv;
+    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_2", &tmp_val) == ESP_OK) {
+      params.fc_2 = (float)tmp_val;
     }
     
-    make_flow_key(key, sizeof(key), (dspFlows_t)flow, "gain_2");
-    if (ui_http_load_param(key, &tmpv) == ESP_OK) {
-      params.gain_2 = (float)tmpv;
+    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_2", &tmp_val) == ESP_OK) {
+      params.gain_2 = (float)tmp_val;
     }
     
-    make_flow_key(key, sizeof(key), (dspFlows_t)flow, "fc_3");
-    if (ui_http_load_param(key, &tmpv) == ESP_OK) {
-      params.fc_3 = (float)tmpv;
+    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_3", &tmp_val) == ESP_OK) {
+      params.fc_3 = (float)tmp_val;
     }
     
-    make_flow_key(key, sizeof(key), (dspFlows_t)flow, "gain_3");
-    if (ui_http_load_param(key, &tmpv) == ESP_OK) {
-      params.gain_3 = (float)tmpv;
+    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_3", &tmp_val) == ESP_OK) {
+      params.gain_3 = (float)tmp_val;
     }
     
     // Store in DSP processor's centralized storage
@@ -1060,8 +919,8 @@ static void http_server_task(void *pvParameters) {
       if (strcmp(urlBuf.key, "dspFlow") == 0) {
         dspFlows_t new_flow = (dspFlows_t)urlBuf.int_value;
         
-        // Save current flow ID to NVS
-        if (ui_http_save_param("active_flow", (int32_t)new_flow) != ESP_OK) {
+        // Save current flow ID to NVS using dsp_settings
+        if (dsp_settings_save_active_flow(new_flow) != ESP_OK) {
           ESP_LOGW(TAG, "%s: Failed to persist active_flow to NVS", __func__);
         }
         
@@ -1112,12 +971,11 @@ static void http_server_task(void *pvParameters) {
       dsp_processor_set_params_for_flow(current_flow, &current_params);
 #endif
 
-      // Persist with flow-specific key
-      make_flow_key(key, sizeof(key), current_flow, urlBuf.key);
-      if (ui_http_save_param(key, urlBuf.int_value) != ESP_OK) {
-        ESP_LOGW(TAG, "%s: Failed to persist param '%s' to NVS", __func__, key);
+      // Persist parameter using dsp_settings (values are stored as int32_t)
+      if (dsp_settings_save_flow_param(current_flow, urlBuf.key, urlBuf.int_value) != ESP_OK) {
+        ESP_LOGW(TAG, "%s: Failed to persist param '%s' to NVS", __func__, urlBuf.key);
       } else {
-        ESP_LOGD(TAG, "%s: Saved %s = %d to NVS", __func__, key, urlBuf.int_value);
+        ESP_LOGD(TAG, "%s: Saved %s = %d to NVS", __func__, urlBuf.key, urlBuf.int_value);
       }
     }
   }
@@ -1132,15 +990,6 @@ static void http_server_task(void *pvParameters) {
  */
 void init_http_server_task(void) {
   ESP_LOGD(TAG, "%s: initializing", __func__);
-  
-  // Create NVS mutex if not already created
-  if (!nvs_mutex) {
-    nvs_mutex = xSemaphoreCreateMutex();
-    if (!nvs_mutex) {
-      ESP_LOGE(TAG, "%s: Failed to create NVS mutex", __func__);
-      return;
-    }
-  }
   
   // Initialize SPIFFS
   ESP_LOGI(TAG, "%s: Initializing SPIFFS", __func__);

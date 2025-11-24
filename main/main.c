@@ -45,6 +45,7 @@
 #include "driver/i2s_std.h"
 #if CONFIG_USE_DSP_PROCESSOR
 #include "dsp_processor.h"
+#include "dsp_processor_settings.h"
 #endif
 
 // Opus decoder is implemented as a subcomponet from master git repo
@@ -2616,6 +2617,7 @@ void app_main(void) {
   esp_log_level_set("wifi_init", ESP_LOG_WARN);
   esp_log_level_set("httpd_uri", ESP_LOG_WARN);
   esp_log_level_set("settings", ESP_LOG_DEBUG);
+  esp_log_level_set("dsp_settings", ESP_LOG_DEBUG);
   esp_log_level_set("UI_HTTP", ESP_LOG_WARN);
   esp_log_level_set("dspProc", ESP_LOG_DEBUG);
 
@@ -2812,6 +2814,7 @@ void app_main(void) {
 #endif
 
 #if CONFIG_USE_DSP_PROCESSOR
+  dsp_settings_init();
   dsp_processor_init();
 #endif
 

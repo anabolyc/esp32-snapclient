@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "sdkconfig.h"
+#include "cJSON.h"
 
 static const char *TAG = "settings";
 static const char *NVS_NAMESPACE = "snapclient";
@@ -466,5 +467,127 @@ esp_err_t settings_clear_server_port(void) {
 
     nvs_close(h);
     xSemaphoreGive(hostname_mutex);
+    return err;
+}
+
+esp_err_t settings_get_json(char *json_out, size_t max_len) {
+    ESP_LOGD(TAG, "%s: entered", __func__);
+    
+    if (!json_out || max_len == 0) return ESP_ERR_INVALID_ARG;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        ESP_LOGE(TAG, "%s: Failed to create JSON object", __func__);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Get hostname
+    char hostname[64] = {0};
+    if (settings_get_hostname(hostname, sizeof(hostname)) == ESP_OK) {
+        cJSON_AddStringToObject(root, "hostname", hostname);
+    }
+
+    // Get mdns enabled
+    bool mdns = true;
+    if (settings_get_mdns_enabled(&mdns) == ESP_OK) {
+        cJSON_AddBoolToObject(root, "mdns_enabled", mdns);
+    }
+
+    // Get server host
+    char host[128] = {0};
+    if (settings_get_server_host(host, sizeof(host)) == ESP_OK && host[0] != '\0') {
+        cJSON_AddStringToObject(root, "server_host", host);
+    }
+
+    // Get server port
+    int32_t port = 0;
+    if (settings_get_server_port(&port) == ESP_OK && port != 0) {
+        cJSON_AddNumberToObject(root, "server_port", port);
+    }
+
+    // Add DSP availability flag
+#if CONFIG_USE_DSP_PROCESSOR
+    cJSON_AddBoolToObject(root, "dsp_available", true);
+#else
+    cJSON_AddBoolToObject(root, "dsp_available", false);
+#endif
+
+    // Render to string
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!json_str) {
+        ESP_LOGE(TAG, "%s: Failed to render JSON", __func__);
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (strlen(json_str) >= max_len) {
+        ESP_LOGE(TAG, "%s: JSON too large for buffer", __func__);
+        cJSON_free(json_str);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    strncpy(json_out, json_str, max_len - 1);
+    json_out[max_len - 1] = '\0';
+    cJSON_free(json_str);
+
+    ESP_LOGD(TAG, "%s: JSON generated: %s", __func__, json_out);
+    return ESP_OK;
+}
+
+esp_err_t settings_set_from_json(const char *json_in) {
+    ESP_LOGD(TAG, "%s: json=%s", __func__, json_in);
+    
+    if (!json_in) return ESP_ERR_INVALID_ARG;
+
+    cJSON *root = cJSON_Parse(json_in);
+    if (!root) {
+        ESP_LOGE(TAG, "%s: Failed to parse JSON", __func__);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ESP_OK;
+
+    // Update hostname if present
+    cJSON *hostname = cJSON_GetObjectItem(root, "hostname");
+    if (cJSON_IsString(hostname) && hostname->valuestring) {
+        esp_err_t save_err = settings_set_hostname(hostname->valuestring);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save hostname", __func__);
+            err = save_err;
+        }
+    }
+
+    // Update mdns_enabled if present
+    cJSON *mdns = cJSON_GetObjectItem(root, "mdns_enabled");
+    if (cJSON_IsBool(mdns)) {
+        esp_err_t save_err = settings_set_mdns_enabled(cJSON_IsTrue(mdns));
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save mdns_enabled", __func__);
+            err = save_err;
+        }
+    }
+
+    // Update server_host if present
+    cJSON *host = cJSON_GetObjectItem(root, "server_host");
+    if (cJSON_IsString(host) && host->valuestring) {
+        esp_err_t save_err = settings_set_server_host(host->valuestring);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save server_host", __func__);
+            err = save_err;
+        }
+    }
+
+    // Update server_port if present
+    cJSON *port = cJSON_GetObjectItem(root, "server_port");
+    if (cJSON_IsNumber(port)) {
+        esp_err_t save_err = settings_set_server_port((int32_t)port->valueint);
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "%s: Failed to save server_port", __func__);
+            err = save_err;
+        }
+    }
+
+    cJSON_Delete(root);
     return err;
 }

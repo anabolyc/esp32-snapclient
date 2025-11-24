@@ -189,20 +189,18 @@
       const app = document.getElementById('app');
       
       try {
-        // Get current hostname
-        const response = await getParameter('hostname');
-        currentHostname = response !== null ? response : 'esp32-snapclient';
-
-        // Snapserver settings
-        const mdnsResp = await getParameter('snapserver_use_mdns');
-        // mdnsResp may be 1 or 0 (number) or null
-        currentSnapUseMDNS = (mdnsResp === null) ? true : (mdnsResp !== 0);
-
-        const hostResp = await getParameter('snapserver_host');
-        currentSnapHost = hostResp !== null ? hostResp : '';
-
-        const portResp = await getParameter('snapserver_port');
-        currentSnapPort = portResp !== null ? portResp : '';
+        // Fetch all settings from capabilities endpoint
+        const response = await fetch('/capabilities?tab=general');
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        const capabilities = await response.json();
+        
+        // Extract settings with defaults
+        currentHostname = capabilities.hostname || 'esp32-snapclient';
+        currentSnapUseMDNS = capabilities.mdns_enabled !== undefined ? capabilities.mdns_enabled : true;
+        currentSnapHost = capabilities.server_host || '';
+        currentSnapPort = capabilities.server_port || '';
         
         renderUI();
       } catch (error) {
