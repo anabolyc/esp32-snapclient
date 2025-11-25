@@ -11,7 +11,11 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "cJSON.h"
+
+// Forward declaration to avoid circular dependency
+extern QueueHandle_t dsp_processor_get_filter_queue(void);
 
 static const char *TAG = "dsp_settings";
 static const char *NVS_NAMESPACE = "dsp_settings";
@@ -19,6 +23,23 @@ static const char *NVS_KEY_ACTIVE_FLOW = "active_flow";
 
 // Mutex for thread-safe NVS access
 static SemaphoreHandle_t dsp_settings_mutex = NULL;
+
+// In-memory state cache for fast access
+static struct {
+    dspFlows_t active_flow;
+    bool initialized;
+    struct {
+        float fc_1;
+        float gain_1;
+        float fc_2;
+        float gain_2;
+        float fc_3;
+        float gain_3;
+    } flow_params[DSP_FLOW_COUNT];
+} settings_cache = {
+    .active_flow = dspfStereo,
+    .initialized = false
+};
 
 /**
  * Generate flow-specific NVS key
@@ -402,7 +423,7 @@ esp_err_t dsp_settings_get_json(char *json_out, size_t max_len) {
     json_out[max_len - 1] = '\0';
     cJSON_free(json_str);
 
-    ESP_LOGD(TAG, "%s: JSON generated: %s", __func__, json_out);
+    ESP_LOGV(TAG, "%s: JSON generated: %s", __func__, json_out);
     return ESP_OK;
 }
 
@@ -450,5 +471,172 @@ esp_err_t dsp_settings_set_from_json(const char *json_in) {
     }
 
     cJSON_Delete(root);
+    return err;
+}
+
+/**
+ * Get current active flow
+ */
+dspFlows_t dsp_settings_get_active_flow(void) {
+    if (!settings_cache.initialized) {
+        // Try to load from NVS
+        dspFlows_t flow;
+        if (dsp_settings_load_active_flow(&flow) == ESP_OK) {
+            settings_cache.active_flow = flow;
+        }
+        settings_cache.initialized = true;
+    }
+    return settings_cache.active_flow;
+}
+
+/**
+ * Get parameters for a specific flow
+ */
+esp_err_t dsp_settings_get_flow_params(dspFlows_t flow, filterParams_t *params) {
+    if (!params || flow < 0 || flow >= DSP_FLOW_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (!dsp_settings_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    xSemaphoreTake(dsp_settings_mutex, portMAX_DELAY);
+    
+    // Return from cache if initialized, otherwise load from NVS
+    params->dspFlow = flow;
+    
+    if (settings_cache.initialized) {
+        params->fc_1 = settings_cache.flow_params[flow].fc_1;
+        params->gain_1 = settings_cache.flow_params[flow].gain_1;
+        params->fc_2 = settings_cache.flow_params[flow].fc_2;
+        params->gain_2 = settings_cache.flow_params[flow].gain_2;
+        params->fc_3 = settings_cache.flow_params[flow].fc_3;
+        params->gain_3 = settings_cache.flow_params[flow].gain_3;
+    } else {
+        // Load from NVS
+        int32_t value;
+        if (dsp_settings_load_flow_param(flow, "fc_1", &value) == ESP_OK) {
+            params->fc_1 = (float)value;
+            settings_cache.flow_params[flow].fc_1 = (float)value;
+        } else {
+            params->fc_1 = 0.0f;
+        }
+        
+        if (dsp_settings_load_flow_param(flow, "gain_1", &value) == ESP_OK) {
+            params->gain_1 = (float)value;
+            settings_cache.flow_params[flow].gain_1 = (float)value;
+        } else {
+            params->gain_1 = 0.0f;
+        }
+        
+        if (dsp_settings_load_flow_param(flow, "fc_2", &value) == ESP_OK) {
+            params->fc_2 = (float)value;
+            settings_cache.flow_params[flow].fc_2 = (float)value;
+        } else {
+            params->fc_2 = 0.0f;
+        }
+        
+        if (dsp_settings_load_flow_param(flow, "gain_2", &value) == ESP_OK) {
+            params->gain_2 = (float)value;
+            settings_cache.flow_params[flow].gain_2 = (float)value;
+        } else {
+            params->gain_2 = 0.0f;
+        }
+        
+        if (dsp_settings_load_flow_param(flow, "fc_3", &value) == ESP_OK) {
+            params->fc_3 = (float)value;
+            settings_cache.flow_params[flow].fc_3 = (float)value;
+        } else {
+            params->fc_3 = 0.0f;
+        }
+        
+        if (dsp_settings_load_flow_param(flow, "gain_3", &value) == ESP_OK) {
+            params->gain_3 = (float)value;
+            settings_cache.flow_params[flow].gain_3 = (float)value;
+        } else {
+            params->gain_3 = 0.0f;
+        }
+        
+        settings_cache.initialized = true;
+    }
+    
+    xSemaphoreGive(dsp_settings_mutex);
+    return ESP_OK;
+}
+
+/**
+ * Set parameters for a specific flow and notify subscribers
+ */
+esp_err_t dsp_settings_set_flow_params(dspFlows_t flow, const filterParams_t *params) {
+    if (!params || flow < 0 || flow >= DSP_FLOW_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Setting params for flow %d: fc_1=%.1f gain_1=%.1f", 
+             flow, params->fc_1, params->gain_1);
+    
+    // Save to NVS
+    esp_err_t err = ESP_OK;
+    err |= dsp_settings_save_flow_param(flow, "fc_1", (int32_t)params->fc_1);
+    err |= dsp_settings_save_flow_param(flow, "gain_1", (int32_t)params->gain_1);
+    err |= dsp_settings_save_flow_param(flow, "fc_2", (int32_t)params->fc_2);
+    err |= dsp_settings_save_flow_param(flow, "gain_2", (int32_t)params->gain_2);
+    err |= dsp_settings_save_flow_param(flow, "fc_3", (int32_t)params->fc_3);
+    err |= dsp_settings_save_flow_param(flow, "gain_3", (int32_t)params->gain_3);
+    
+    if (err == ESP_OK) {
+        // Update cache
+        settings_cache.flow_params[flow].fc_1 = params->fc_1;
+        settings_cache.flow_params[flow].gain_1 = params->gain_1;
+        settings_cache.flow_params[flow].fc_2 = params->fc_2;
+        settings_cache.flow_params[flow].gain_2 = params->gain_2;
+        settings_cache.flow_params[flow].fc_3 = params->fc_3;
+        settings_cache.flow_params[flow].gain_3 = params->gain_3;
+        settings_cache.initialized = true;
+        
+        // Notify DSP processor if this is the active flow
+        if (flow == settings_cache.active_flow) {
+            QueueHandle_t queue = dsp_processor_get_filter_queue();
+            if (queue) {
+                filterParams_t queue_params = *params;
+                xQueueOverwrite(queue, &queue_params);
+                ESP_LOGD(TAG, "Posted params update to DSP processor queue");
+            }
+        }
+    }
+    
+    return err;
+}
+
+/**
+ * Switch active flow and notify subscribers
+ */
+esp_err_t dsp_settings_switch_active_flow(dspFlows_t flow) {
+    if (flow < 0 || flow >= DSP_FLOW_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Switching active flow to %d", flow);
+    
+    // Save to NVS
+    esp_err_t err = dsp_settings_save_active_flow(flow);
+    
+    if (err == ESP_OK) {
+        // Update cache
+        settings_cache.active_flow = flow;
+        settings_cache.initialized = true;
+        
+        // Get parameters for the new flow and notify DSP processor
+        filterParams_t params;
+        dsp_settings_get_flow_params(flow, &params);
+        
+        QueueHandle_t queue = dsp_processor_get_filter_queue();
+        if (queue) {
+            xQueueOverwrite(queue, &params);
+            ESP_LOGD(TAG, "Posted flow switch to DSP processor queue");
+        }
+    }
+    
     return err;
 }

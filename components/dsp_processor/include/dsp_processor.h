@@ -6,52 +6,9 @@ extern "C" {
 #endif
 
 #include "esp_err.h"
-
-/**
- * DSP Parameter Limits - Configurable at compile time
- * 
- * These defines control the min/max/default values for all DSP parameters
- * exposed in the UI. Modify these values before compilation to set appropriate
- * limits for your audio system.
- * 
- * All frequency values are in Hz
- * All gain values are in dB
- */
-
-#define DSP_BASS_FREQ_MIN        30.0f
-#define DSP_BASS_FREQ_MAX       500.0f
-#define DSP_BASS_FREQ_DEFAULT   150.0f
-#define DSP_BASS_FREQ_STEP        5.0f
-
-#define DSP_TREBLE_FREQ_MIN      2000.0f
-#define DSP_TREBLE_FREQ_MAX     16000.0f
-#define DSP_TREBLE_FREQ_DEFAULT  8000.0f
-#define DSP_TREBLE_FREQ_STEP      100.0f
-
-#define DSP_GAIN_MIN            -15.0f
-#define DSP_GAIN_MAX             15.0f
-#define DSP_GAIN_DEFAULT          0.0f
-#define DSP_GAIN_STEP             1.0f
-
-#define DSP_BASSBOOST_GAIN_MIN     -18.0f
-#define DSP_BASSBOOST_GAIN_MAX      18.0f
-#define DSP_BASSBOOST_GAIN_DEFAULT   9.0f
-#define DSP_BASSBOOST_GAIN_STEP      1.0f
-
-#define DSP_CROSSOVER_FREQ_MIN        80.0f
-#define DSP_CROSSOVER_FREQ_MAX      3000.0f
-#define DSP_CROSSOVER_FREQ_DEFAULT   500.0f
-#define DSP_CROSSOVER_FREQ_STEP       10.0f
-
-typedef enum dspFlows {
-  dspfStereo,
-  dspfBiamp,
-  dspf2DOT1,
-  dspfFunkyHonda,
-  dspfBassBoost,
-  dspfEQBassTreble,
-  DSP_FLOW_COUNT  // Total number of DSP flows
-} dspFlows_t;
+#include "dsp_types.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 enum filtertypes {
   LPF,
@@ -80,17 +37,6 @@ typedef struct ptype {
   float coeffs[5];
   float w[2];
 } ptype_t;
-
-// used to dynamically change used filters and their parameters
-typedef struct filterParams_s {
-  dspFlows_t dspFlow;
-  float fc_1;
-  float gain_1;
-  float fc_2;
-  float gain_2;
-  float fc_3;
-  float gain_3;
-} filterParams_t;
 
 /**
  * Centralized parameter storage for all DSP flows
@@ -124,6 +70,14 @@ void dsp_processor_uninit(void);
 int dsp_processor_worker(void *pcmChnk, const void *scSet);
 esp_err_t dsp_processor_update_filter_params(filterParams_t *params);
 void dsp_processor_set_volome(double volume);
+
+/**
+ * Get the filter update queue handle for external components to post updates
+ * This allows other components (like dsp_processor_settings) to trigger
+ * filter updates without creating circular dependencies
+ * @return Queue handle or NULL if not initialized
+ */
+QueueHandle_t dsp_processor_get_filter_queue(void);
 
 /**
  * Get current DSP flow

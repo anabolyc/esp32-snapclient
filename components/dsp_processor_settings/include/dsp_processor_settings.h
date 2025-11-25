@@ -18,7 +18,7 @@ extern "C" {
 #include <esp_err.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "dsp_processor.h"
+#include "dsp_types.h"
 
 /**
  * Initialize DSP settings manager
@@ -92,6 +92,39 @@ esp_err_t dsp_settings_get_json(char *json_out, size_t max_len);
  * }
  */
 esp_err_t dsp_settings_set_from_json(const char *json_in);
+
+/**
+ * Get current active flow
+ * @return Current active DSP flow
+ */
+dspFlows_t dsp_settings_get_active_flow(void);
+
+/**
+ * Get parameters for a specific flow
+ * @param flow DSP flow to query
+ * @param params Output structure for parameters
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_settings_get_flow_params(dspFlows_t flow, filterParams_t *params);
+
+/**
+ * Set parameters for a specific flow
+ * Persists to NVS and updates cache
+ * 
+ * @param flow DSP flow to update
+ * @param params New parameters
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_settings_set_flow_params(dspFlows_t flow, const filterParams_t *params);
+
+/**
+ * Switch active flow
+ * Persists to NVS and updates cache
+ * 
+ * @param flow New active flow
+ * @return ESP_OK on success
+ */
+esp_err_t dsp_settings_switch_active_flow(dspFlows_t flow);
 
 #ifdef __cplusplus
 }

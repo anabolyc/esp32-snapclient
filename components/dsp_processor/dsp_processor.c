@@ -21,7 +21,7 @@
 #define BIQUAD dsps_biquad_f32
 #endif
 
-static const char *TAG = "dspProc";
+static const char *TAG = "dsp_proc";
 
 #define DSP_PROCESSOR_LEN 16
 
@@ -88,37 +88,24 @@ void dsp_processor_init(void) {
   // dspfStereo has no parameters (pass-through with volume only)
   // dspf2DOT1 and dspfFunkyHonda not yet implemented
 
-  // Load saved parameters from NVS for all flows
-  ESP_LOGI(TAG, "%s: Loading saved parameters from NVS", __func__);
-  for (int flow = 0; flow < DSP_FLOW_COUNT; flow++) {
-    int32_t fc_1, gain_1, fc_2, gain_2, fc_3, gain_3;
-    
-    // Load each parameter, keeping defaults if not found in NVS
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_1", &fc_1) == ESP_OK) {
-      all_params.flow_params[flow].fc_1 = (float)fc_1;
-    }
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_1", &gain_1) == ESP_OK) {
-      all_params.flow_params[flow].gain_1 = (float)gain_1;
-    }
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_2", &fc_2) == ESP_OK) {
-      all_params.flow_params[flow].fc_2 = (float)fc_2;
-    }
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_2", &gain_2) == ESP_OK) {
-      all_params.flow_params[flow].gain_2 = (float)gain_2;
-    }
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "fc_3", &fc_3) == ESP_OK) {
-      all_params.flow_params[flow].fc_3 = (float)fc_3;
-    }
-    if (dsp_settings_load_flow_param((dspFlows_t)flow, "gain_3", &gain_3) == ESP_OK) {
-      all_params.flow_params[flow].gain_3 = (float)gain_3;
-    }
-  }
+  // Load saved parameters from settings (which handles NVS)
+  ESP_LOGI(TAG, "%s: Loading saved parameters from settings", __func__);
   
   // Load saved active flow
-  dspFlows_t saved_flow;
-  if (dsp_settings_load_active_flow(&saved_flow) == ESP_OK) {
-    all_params.active_flow = saved_flow;
-    ESP_LOGI(TAG, "%s: Restored active flow: %d", __func__, saved_flow);
+  all_params.active_flow = dsp_settings_get_active_flow();
+  ESP_LOGI(TAG, "%s: Restored active flow: %d", __func__, all_params.active_flow);
+  
+  // Load parameters for all flows
+  for (int flow = 0; flow < DSP_FLOW_COUNT; flow++) {
+    filterParams_t params;
+    if (dsp_settings_get_flow_params((dspFlows_t)flow, &params) == ESP_OK) {
+      all_params.flow_params[flow].fc_1 = params.fc_1;
+      all_params.flow_params[flow].gain_1 = params.gain_1;
+      all_params.flow_params[flow].fc_2 = params.fc_2;
+      all_params.flow_params[flow].gain_2 = params.gain_2;
+      all_params.flow_params[flow].fc_3 = params.fc_3;
+      all_params.flow_params[flow].gain_3 = params.gain_3;
+    }
   }
 
   ESP_LOGI(TAG, "%s: Initialized with flow=%d, fc_1=%.1f, gain_1=%.1f", __func__,
@@ -279,6 +266,7 @@ int dsp_processor_worker(void *p_pcmChnk, const void *p_scSet) {
   // Check if we need to update filters from queue
   filterParams_t newParams;
   if (xQueueReceive(filterUpdateQHdl, &newParams, pdMS_TO_TICKS(0)) == pdTRUE) {
+    ESP_LOGI(TAG, "Applying filter update: flow=%d", newParams.dspFlow);
     currentFilterParams = newParams;
     init = false;
   }
@@ -763,6 +751,13 @@ void dsp_processor_set_volome(double volume) {
 dspFlows_t dsp_processor_get_current_flow(void) {
   ESP_LOGD(TAG, "%s: returning flow=%d", __func__, all_params.active_flow);
   return all_params.active_flow;
+}
+
+/**
+ * Get the filter update queue handle
+ */
+QueueHandle_t dsp_processor_get_filter_queue(void) {
+  return filterUpdateQHdl;
 }
 
 /**

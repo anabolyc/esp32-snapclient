@@ -12,7 +12,6 @@
 
 #include <string.h>
 
-#include "dsp_processor.h"
 #include "dsp_processor_settings.h"
 #include "esp_err.h"
 #include "esp_http_server.h"
@@ -418,19 +417,16 @@ static esp_err_t get_param_handler(httpd_req_t *req) {
 						 __func__);
 			}
 			return ESP_OK;
-		}
+	}
 
 #if CONFIG_USE_DSP_PROCESSOR
-		// Get current flow from DSP processor
-		dspFlows_t current_flow = dsp_processor_get_current_flow();
+	// Get current flow from settings
+	dspFlows_t current_flow = dsp_settings_get_active_flow();
 
-		// Get parameters for current flow
-		filterParams_t params;
-		if (dsp_processor_get_params_for_flow(current_flow, &params) ==
-			ESP_OK) {
-			int32_t value = 0;
-
-			// Map parameter name to value
+	// Get parameters for current flow
+	filterParams_t params;
+	if (dsp_settings_get_flow_params(current_flow, &params) == ESP_OK) {
+		int32_t value = 0;			// Map parameter name to value
 			if (strcmp(param, "fc_1") == 0) {
 				value = (int32_t)params.fc_1;
 			} else if (strcmp(param, "gain_1") == 0) {
@@ -802,10 +798,10 @@ static void http_server_task(void *pvParameters) {
 	memset(&current_params, 0, sizeof(filterParams_t));
 
 #if CONFIG_USE_DSP_PROCESSOR
-	active_flow = dsp_processor_get_current_flow();
-	dsp_processor_get_params_for_flow(active_flow, &current_params);
+	active_flow = dsp_settings_get_active_flow();
+	dsp_settings_get_flow_params(active_flow, &current_params);
 	ESP_LOGI(TAG, "%s: Current flow %d with fc_1=%.1f gain_1=%.1f", __func__,
-			 active_flow, current_params.fc_1, current_params.gain_1);
+		 active_flow, current_params.fc_1, current_params.gain_1);
 #else
 	current_params.dspFlow = active_flow;
 #endif
@@ -817,30 +813,22 @@ static void http_server_task(void *pvParameters) {
 			ESP_LOGI(TAG, "%s: received update: %s = %d", __func__, urlBuf.key,
 					 urlBuf.int_value);
 
-			// Handle flow change specially
-			if (strcmp(urlBuf.key, "dspFlow") == 0) {
-				dspFlows_t new_flow = (dspFlows_t)urlBuf.int_value;
-
-				// Save current flow ID to NVS using dsp_settings
-				if (dsp_settings_save_active_flow(new_flow) != ESP_OK) {
-					ESP_LOGW(TAG, "%s: Failed to persist active_flow to NVS",
-							 __func__);
-				}
+		// Handle flow change specially
+		if (strcmp(urlBuf.key, "dspFlow") == 0) {
+			dspFlows_t new_flow = (dspFlows_t)urlBuf.int_value;
 
 #if CONFIG_USE_DSP_PROCESSOR
-				// Switch to new flow (loads its stored parameters)
-				dsp_processor_switch_flow(new_flow);
-				// Get the parameters for the new flow
-				dsp_processor_get_params_for_flow(new_flow, &current_params);
+			// Switch to new flow (loads its stored parameters and notifies subscribers)
+			dsp_settings_switch_active_flow(new_flow);
+			// Get the parameters for the new flow
+			dsp_settings_get_flow_params(new_flow, &current_params);
+      ESP_LOGI(TAG, "%s: Switched to flow %d", __func__, new_flow);
 #else
-				current_params.dspFlow = new_flow;
+			current_params.dspFlow = new_flow;
 #endif
 
-				ESP_LOGI(TAG, "%s: Switched to flow %d", __func__, new_flow);
-				continue;
-			}
-
-			// Handle parameter updates for current flow
+			continue;
+		}			// Handle parameter updates for current flow
 			bool param_recognized = false;
 			dspFlows_t current_flow = current_params.dspFlow;
 
@@ -864,31 +852,32 @@ static void http_server_task(void *pvParameters) {
 				param_recognized = true;
 			}
 
-			if (!param_recognized) {
-				ESP_LOGW(TAG, "%s: Unknown param '%s' received, ignoring",
-						 __func__, urlBuf.key);
-				continue;
-			}
+
+		if (!param_recognized) {
+			ESP_LOGW(TAG, "%s: Unknown param '%s' received, ignoring",
+					 __func__, urlBuf.key);
+			continue;
+		}
 
 #if CONFIG_USE_DSP_PROCESSOR
-			// Apply updated params to DSP
-			dsp_processor_set_params_for_flow(current_flow, &current_params);
-#endif
-
-			// Persist parameter using dsp_settings (values are stored as
-			// int32_t)
-			if (dsp_settings_save_flow_param(current_flow, urlBuf.key,
-											 urlBuf.int_value) != ESP_OK) {
-				ESP_LOGW(TAG, "%s: Failed to persist param '%s' to NVS",
-						 __func__, urlBuf.key);
-			} else {
-				ESP_LOGD(TAG, "%s: Saved %s = %d to NVS", __func__, urlBuf.key,
-						 urlBuf.int_value);
-			}
+		// Update settings and notify subscribers (includes NVS persistence)
+		dsp_settings_set_flow_params(current_flow, &current_params);
+		ESP_LOGD(TAG, "%s: Updated %s = %d", __func__, urlBuf.key,
+				 urlBuf.int_value);
+#else
+		// Persist parameter using dsp_settings (values are stored as
+		// int32_t)
+		if (dsp_settings_save_flow_param(current_flow, urlBuf.key,
+										 urlBuf.int_value) != ESP_OK) {
+			ESP_LOGW(TAG, "%s: Failed to persist param '%s' to NVS",
+					 __func__, urlBuf.key);
+		} else {
+			ESP_LOGD(TAG, "%s: Saved %s = %d to NVS", __func__, urlBuf.key,
+					 urlBuf.int_value);
 		}
+#endif
 	}
-
-	// Never reach here
+}	// Never reach here
 	ESP_LOGI(TAG, "%s: finish", __func__);
 	vTaskDelete(NULL);
 }

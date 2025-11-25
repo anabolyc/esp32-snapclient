@@ -531,7 +531,7 @@ esp_err_t settings_get_json(char *json_out, size_t max_len) {
     json_out[max_len - 1] = '\0';
     cJSON_free(json_str);
 
-    ESP_LOGD(TAG, "%s: JSON generated: %s", __func__, json_out);
+    ESP_LOGV(TAG, "%s: JSON generated: %s", __func__, json_out);
     return ESP_OK;
 }
 
