@@ -22,6 +22,10 @@
 #include "freertos/task.h"
 #include "settings_manager.h"
 
+#if CONFIG_DAC_TAS5805M
+#include "tas5805m_settings.h"
+#endif
+
 static const char *TAG = "UI_HTTP";
 
 static QueueHandle_t xQueueHttp = NULL;
@@ -39,6 +43,8 @@ extern const uint8_t general_settings_html_start[] asm("_binary_general_settings
 extern const uint8_t general_settings_html_end[] asm("_binary_general_settings_html_end");
 extern const uint8_t dsp_settings_html_start[] asm("_binary_dsp_settings_html_start");
 extern const uint8_t dsp_settings_html_end[] asm("_binary_dsp_settings_html_end");
+extern const uint8_t dac_settings_html_start[] asm("_binary_dac_settings_html_start");
+extern const uint8_t dac_settings_html_end[] asm("_binary_dac_settings_html_end");
 extern const uint8_t favicon_ico_start[] asm("_binary_favicon_ico_start");
 extern const uint8_t favicon_ico_end[] asm("_binary_favicon_ico_end");
 
@@ -57,6 +63,7 @@ static const embedded_file_t embedded_files[] = {
 	{"/styles.css", styles_css_start, styles_css_end, "text/css; charset=utf-8"},
 	{"/general-settings.html", general_settings_html_start, general_settings_html_end, "text/html; charset=utf-8"},
 	{"/dsp-settings.html", dsp_settings_html_start, dsp_settings_html_end, "text/html; charset=utf-8"},
+	{"/dac-settings.html", dac_settings_html_start, dac_settings_html_end, "text/html; charset=utf-8"},
 	{"/favicon.ico", favicon_ico_start, favicon_ico_end, "image/x-icon"},
 };
 
@@ -594,6 +601,131 @@ static esp_err_t favicon_get_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
+#if CONFIG_DAC_TAS5805M
+/*
+ * GET /api/dac/settings handler
+ * Returns current TAS5805M DAC settings as JSON
+ */
+static esp_err_t get_dac_settings_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  
+  set_cors_headers(req);
+  
+  char *dac_json = (char *)malloc(1024);
+  if (!dac_json) {
+    ESP_LOGE(TAG, "%s: Failed to allocate memory for DAC JSON", __func__);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+    return ESP_OK;
+  }
+  
+  esp_err_t ret = tas5805m_settings_get_json(dac_json, 1024);
+  
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to get DAC settings JSON: %s", __func__, esp_err_to_name(ret));
+    free(dac_json);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to retrieve DAC settings\"}");
+    return ESP_OK;
+  }
+  
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, dac_json);
+  free(dac_json);
+  
+  return ESP_OK;
+}
+
+/*
+ * GET /api/dac/schema handler
+ * Returns TAS5805M DAC settings schema as JSON
+ */
+static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  
+  set_cors_headers(req);
+  
+  char *schema_json = (char *)malloc(2048);
+  if (!schema_json) {
+    ESP_LOGE(TAG, "%s: Failed to allocate memory for DAC schema JSON", __func__);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+    return ESP_OK;
+  }
+  
+  esp_err_t ret = tas5805m_settings_get_schema_json(schema_json, 2048);
+  
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to get DAC schema JSON: %s", __func__, esp_err_to_name(ret));
+    free(schema_json);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to retrieve DAC schema\"}");
+    return ESP_OK;
+  }
+  
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, schema_json);
+  free(schema_json);
+  
+  return ESP_OK;
+}
+
+/*
+ * POST /api/dac/settings handler
+ * Updates TAS5805M DAC settings from JSON
+ */
+static esp_err_t post_dac_settings_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  
+  set_cors_headers(req);
+  
+  // Allocate buffer for request body
+  char *buf = (char *)malloc(req->content_len + 1);
+  if (!buf) {
+    ESP_LOGE(TAG, "%s: Failed to allocate buffer for request body", __func__);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+    return ESP_OK;
+  }
+  
+  // Read request body
+  int ret = httpd_req_recv(req, buf, req->content_len);
+  if (ret <= 0) {
+    free(buf);
+    if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+      httpd_resp_set_status(req, "408 Request Timeout");
+      httpd_resp_sendstr(req, "{\"error\": \"Request timeout\"}");
+    } else {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "{\"error\": \"Failed to read request body\"}");
+    }
+    return ESP_OK;
+  }
+  buf[ret] = '\0';
+  
+  ESP_LOGI(TAG, "%s: Received JSON: %s", __func__, buf);
+  
+  // Update settings
+  esp_err_t err = tas5805m_settings_set_from_json(buf);
+  free(buf);
+  
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to update DAC settings: %s", __func__, esp_err_to_name(err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to update DAC settings\"}");
+    return ESP_OK;
+  }
+  
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"success\": true}");
+  
+  return ESP_OK;
+}
+#endif /* CONFIG_DAC_TAS5805M */
+
 /*
  * Static file handler
  * Serves files from embedded flash memory
@@ -757,6 +889,45 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = options_handler,
 	};
 	httpd_register_uri_handler(server, &_options_capabilities_handler);
+
+#if CONFIG_DAC_TAS5805M
+	/* URI handlers for DAC settings API */
+	httpd_uri_t _get_dac_settings_handler = {
+		.uri = "/api/dac/settings",
+		.method = HTTP_GET,
+		.handler = get_dac_settings_handler,
+	};
+	httpd_register_uri_handler(server, &_get_dac_settings_handler);
+
+	httpd_uri_t _get_dac_schema_handler = {
+		.uri = "/api/dac/schema",
+		.method = HTTP_GET,
+		.handler = get_dac_schema_handler,
+	};
+	httpd_register_uri_handler(server, &_get_dac_schema_handler);
+
+	httpd_uri_t _post_dac_settings_handler = {
+		.uri = "/api/dac/settings",
+		.method = HTTP_POST,
+		.handler = post_dac_settings_handler,
+	};
+	httpd_register_uri_handler(server, &_post_dac_settings_handler);
+
+	/* OPTIONS handlers for CORS preflight - DAC endpoints */
+	httpd_uri_t _options_dac_settings_handler = {
+		.uri = "/api/dac/settings",
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	httpd_register_uri_handler(server, &_options_dac_settings_handler);
+
+	httpd_uri_t _options_dac_schema_handler = {
+		.uri = "/api/dac/schema",
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	httpd_register_uri_handler(server, &_options_dac_schema_handler);
+#endif /* CONFIG_DAC_TAS5805M */
 
 	/* URI handler for static files (catch-all, must be last) */
 	httpd_uri_t _static_file_handler = {
