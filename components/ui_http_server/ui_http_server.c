@@ -646,15 +646,22 @@ static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
   
   set_cors_headers(req);
   
-  char *schema_json = (char *)malloc(2048);
-  if (!schema_json) {
-    ESP_LOGE(TAG, "%s: Failed to allocate memory for DAC schema JSON", __func__);
-    httpd_resp_set_status(req, "500 Internal Server Error");
-    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
-    return ESP_OK;
-  }
-  
-  esp_err_t ret = tas5805m_settings_get_schema_json(schema_json, 2048);
+		/* Allocate schema buffer size conditionally: large buffer only if EQ support enabled */
+	#if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
+		const size_t schema_buf_size = 8192;
+	#else
+		const size_t schema_buf_size = 2048;
+	#endif
+
+		char *schema_json = (char *)malloc(schema_buf_size);
+		if (!schema_json) {
+			ESP_LOGE(TAG, "%s: Failed to allocate memory for DAC schema JSON (size=%zu)", __func__, schema_buf_size);
+			httpd_resp_set_status(req, "500 Internal Server Error");
+			httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+			return ESP_OK;
+		}
+
+		esp_err_t ret = tas5805m_settings_get_schema_json(schema_json, schema_buf_size);
   
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "%s: Failed to get DAC schema JSON: %s", __func__, esp_err_to_name(ret));
