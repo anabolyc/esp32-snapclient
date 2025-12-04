@@ -649,9 +649,9 @@ static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
 		/* Allocate schema buffer size conditionally: large buffer only if EQ support enabled */
 	#if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
 		/* EQ adds many parameters to the schema; increase buffer slightly to avoid overflow */
-		const size_t schema_buf_size = 12288; /* 12 KiB */
+		const size_t schema_buf_size = 12 * 1024; /* 12 KiB */
 	#else
-		const size_t schema_buf_size = 2048;
+		const size_t schema_buf_size = 3 * 1024; /* 3 KiB */
 	#endif
 
 		char *schema_json = (char *)malloc(schema_buf_size);
