@@ -601,7 +601,6 @@ static esp_err_t favicon_get_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
-#if CONFIG_DAC_TAS5805M
 /*
  * GET /api/dac/settings handler
  * Returns current TAS5805M DAC settings as JSON
@@ -611,6 +610,7 @@ static esp_err_t get_dac_settings_handler(httpd_req_t *req) {
   
   set_cors_headers(req);
   
+#if CONFIG_DAC_TAS5805M
   char *dac_json = (char *)malloc(1024);
   if (!dac_json) {
     ESP_LOGE(TAG, "%s: Failed to allocate memory for DAC JSON", __func__);
@@ -635,6 +635,11 @@ static esp_err_t get_dac_settings_handler(httpd_req_t *req) {
   free(dac_json);
   
   return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "{\"error\": \"TAS5805M not configured\"}");
+  return ESP_OK;
+#endif
 }
 
 /*
@@ -646,6 +651,7 @@ static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
   
   set_cors_headers(req);
   
+#if CONFIG_DAC_TAS5805M
 		/* Allocate schema buffer size conditionally: large buffer only if EQ support enabled */
 	#if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
 		/* EQ adds many parameters to the schema; increase buffer slightly to avoid overflow */
@@ -678,6 +684,11 @@ static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
   free(schema_json);
   
   return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "{\"error\": \"TAS5805M not configured\"}");
+  return ESP_OK;
+#endif
 }
 
 /*
@@ -689,6 +700,7 @@ static esp_err_t post_dac_settings_handler(httpd_req_t *req) {
   
   set_cors_headers(req);
   
+#if CONFIG_DAC_TAS5805M
   // Allocate buffer for request body
   char *buf = (char *)malloc(req->content_len + 1);
   if (!buf) {
@@ -731,8 +743,12 @@ static esp_err_t post_dac_settings_handler(httpd_req_t *req) {
   httpd_resp_sendstr(req, "{\"success\": true}");
   
   return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "{\"error\": \"TAS5805M not configured\"}");
+  return ESP_OK;
+#endif
 }
-#endif /* CONFIG_DAC_TAS5805M */
 
 /*
  * Static file handler
