@@ -37,6 +37,8 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 extern const uint8_t index_js_start[] asm("_binary_index_js_start");
 extern const uint8_t index_js_end[] asm("_binary_index_js_end");
+extern const uint8_t settings_ui_js_start[] asm("_binary_settings_ui_js_start");
+extern const uint8_t settings_ui_js_end[] asm("_binary_settings_ui_js_end");
 extern const uint8_t styles_css_start[] asm("_binary_styles_css_start");
 extern const uint8_t styles_css_end[] asm("_binary_styles_css_end");
 extern const uint8_t general_settings_html_start[] asm("_binary_general_settings_html_start");
@@ -45,6 +47,8 @@ extern const uint8_t dsp_settings_html_start[] asm("_binary_dsp_settings_html_st
 extern const uint8_t dsp_settings_html_end[] asm("_binary_dsp_settings_html_end");
 extern const uint8_t dac_settings_html_start[] asm("_binary_dac_settings_html_start");
 extern const uint8_t dac_settings_html_end[] asm("_binary_dac_settings_html_end");
+extern const uint8_t eq_settings_html_start[] asm("_binary_eq_settings_html_start");
+extern const uint8_t eq_settings_html_end[] asm("_binary_eq_settings_html_end");
 extern const uint8_t favicon_ico_start[] asm("_binary_favicon_ico_start");
 extern const uint8_t favicon_ico_end[] asm("_binary_favicon_ico_end");
 
@@ -60,10 +64,12 @@ static const embedded_file_t embedded_files[] = {
 	{"/", index_html_start, index_html_end, "text/html; charset=utf-8"},
 	{"/index.html", index_html_start, index_html_end, "text/html; charset=utf-8"},
 	{"/index.js", index_js_start, index_js_end, "application/javascript; charset=utf-8"},
+	{"/settings-ui.js", settings_ui_js_start, settings_ui_js_end, "application/javascript; charset=utf-8"},
 	{"/styles.css", styles_css_start, styles_css_end, "text/css; charset=utf-8"},
 	{"/general-settings.html", general_settings_html_start, general_settings_html_end, "text/html; charset=utf-8"},
 	{"/dsp-settings.html", dsp_settings_html_start, dsp_settings_html_end, "text/html; charset=utf-8"},
 	{"/dac-settings.html", dac_settings_html_start, dac_settings_html_end, "text/html; charset=utf-8"},
+	{"/eq-settings.html", eq_settings_html_start, eq_settings_html_end, "text/html; charset=utf-8"},
 	{"/favicon.ico", favicon_ico_start, favicon_ico_end, "image/x-icon"},
 };
 
@@ -619,7 +625,7 @@ static esp_err_t get_dac_settings_handler(httpd_req_t *req) {
     return ESP_OK;
   }
   
-  esp_err_t ret = tas5805m_settings_get_json(dac_json, 1024);
+  esp_err_t ret = tas5805m_settings_get_dac_json(dac_json, 1024);
   
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "%s: Failed to get DAC settings JSON: %s", __func__, esp_err_to_name(ret));
@@ -655,7 +661,7 @@ static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
 		/* Allocate schema buffer size conditionally: large buffer only if EQ support enabled */
 	#if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
 		/* EQ adds many parameters to the schema; increase buffer slightly to avoid overflow */
-		const size_t schema_buf_size = 12 * 1024; /* 12 KiB */
+		const size_t schema_buf_size = 36 * 1024; /* 12 KiB */
 	#else
 		const size_t schema_buf_size = 3 * 1024; /* 3 KiB */
 	#endif
@@ -668,7 +674,8 @@ static esp_err_t get_dac_schema_handler(httpd_req_t *req) {
 			return ESP_OK;
 		}
 
-		esp_err_t ret = tas5805m_settings_get_schema_json(schema_json, schema_buf_size);
+		/* Use DAC-only schema generator to avoid including EQ parameters */
+		esp_err_t ret = tas5805m_settings_get_dac_schema_json(schema_json, schema_buf_size);
   
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "%s: Failed to get DAC schema JSON: %s", __func__, esp_err_to_name(ret));
@@ -727,14 +734,157 @@ static esp_err_t post_dac_settings_handler(httpd_req_t *req) {
   
   ESP_LOGI(TAG, "%s: Received JSON: %s", __func__, buf);
   
-  // Update settings
-  esp_err_t err = tas5805m_settings_set_from_json(buf);
+  // Update DAC-only settings
+  esp_err_t err = tas5805m_settings_set_dac_from_json(buf);
   free(buf);
   
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "%s: Failed to update DAC settings: %s", __func__, esp_err_to_name(err));
     httpd_resp_set_status(req, "500 Internal Server Error");
     httpd_resp_sendstr(req, "{\"error\": \"Failed to update DAC settings\"}");
+    return ESP_OK;
+  }
+  
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"success\": true}");
+  
+  return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "{\"error\": \"TAS5805M not configured\"}");
+  return ESP_OK;
+#endif
+}
+
+/*
+ * GET /api/eq/settings handler
+ * Returns current TAS5805M EQ settings as JSON
+ */
+static esp_err_t get_eq_settings_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  
+  set_cors_headers(req);
+  
+#if CONFIG_DAC_TAS5805M
+  char *eq_json = (char *)malloc(16 * 1024); // 16KB for EQ settings
+  if (!eq_json) {
+    ESP_LOGE(TAG, "%s: Failed to allocate memory for EQ JSON", __func__);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+    return ESP_OK;
+  }
+  
+  esp_err_t ret = tas5805m_settings_get_eq_json(eq_json, 16 * 1024);
+  
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to get EQ settings JSON: %s", __func__, esp_err_to_name(ret));
+    free(eq_json);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to retrieve EQ settings\"}");
+    return ESP_OK;
+  }
+  
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, eq_json);
+  free(eq_json);
+  
+  return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "{\"error\": \"TAS5805M not configured\"}");
+  return ESP_OK;
+#endif
+}
+
+/*
+ * GET /api/eq/schema handler
+ * Returns TAS5805M EQ settings schema as JSON
+ */
+static esp_err_t get_eq_schema_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  
+  set_cors_headers(req);
+  
+#if CONFIG_DAC_TAS5805M
+  const size_t schema_buf_size = 64 * 1024; // 64KB for EQ schema
+  
+  char *schema_json = (char *)malloc(schema_buf_size);
+  if (!schema_json) {
+    ESP_LOGE(TAG, "%s: Failed to allocate memory for EQ schema JSON (size=%zu)", __func__, schema_buf_size);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+    return ESP_OK;
+  }
+
+  esp_err_t ret = tas5805m_settings_get_eq_schema_json(schema_json, schema_buf_size);
+  
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to get EQ schema JSON: %s", __func__, esp_err_to_name(ret));
+    free(schema_json);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to retrieve EQ schema\"}");
+    return ESP_OK;
+  }
+  
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, schema_json);
+  free(schema_json);
+  
+  return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "{\"error\": \"TAS5805M not configured\"}");
+  return ESP_OK;
+#endif
+}
+
+/*
+ * POST /api/eq/settings handler
+ * Updates TAS5805M EQ settings from JSON
+ */
+static esp_err_t post_eq_settings_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  
+  set_cors_headers(req);
+  
+#if CONFIG_DAC_TAS5805M
+  // Allocate buffer for request body
+  char *buf = (char *)malloc(req->content_len + 1);
+  if (!buf) {
+    ESP_LOGE(TAG, "%s: Failed to allocate buffer for request body", __func__);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Memory allocation failed\"}");
+    return ESP_OK;
+  }
+  
+  // Read request body
+  int ret = httpd_req_recv(req, buf, req->content_len);
+  if (ret <= 0) {
+    free(buf);
+    if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+      httpd_resp_set_status(req, "408 Request Timeout");
+      httpd_resp_sendstr(req, "{\"error\": \"Request timeout\"}");
+    } else {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_sendstr(req, "{\"error\": \"Failed to read request body\"}");
+    }
+    return ESP_OK;
+  }
+  buf[ret] = '\0';
+  
+  ESP_LOGI(TAG, "%s: Received JSON: %s", __func__, buf);
+  
+  // Update EQ settings
+  esp_err_t err = tas5805m_settings_set_eq_from_json(buf);
+  free(buf);
+  
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "%s: Failed to update EQ settings: %s", __func__, esp_err_to_name(err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to update EQ settings\"}");
     return ESP_OK;
   }
   
@@ -818,10 +968,8 @@ esp_err_t start_server(const char *base_path, int port) {
 	ESP_LOGD(TAG, "%s: base_path=%s port=%d", __func__, base_path, port);
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.server_port = port;
-	config.max_open_sockets =
-		7; // Increased from 2 to handle concurrent requests better
-	config.max_uri_handlers =
-		16; // Increased from default (8) to accommodate all handlers
+	config.max_open_sockets = 7;
+	config.max_uri_handlers = 64;
 	config.lru_purge_enable = true; // Enable LRU socket purging
 
 	/* Enable wildcard URI matching for static file handler */
@@ -951,6 +1099,43 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = options_handler,
 	};
 	httpd_register_uri_handler(server, &_options_dac_schema_handler);
+
+	/* URI handlers for EQ settings API */
+	httpd_uri_t _get_eq_settings_handler = {
+		.uri = "/api/eq/settings",
+		.method = HTTP_GET,
+		.handler = get_eq_settings_handler,
+	};
+	httpd_register_uri_handler(server, &_get_eq_settings_handler);
+
+	httpd_uri_t _get_eq_schema_handler = {
+		.uri = "/api/eq/schema",
+		.method = HTTP_GET,
+		.handler = get_eq_schema_handler,
+	};
+	httpd_register_uri_handler(server, &_get_eq_schema_handler);
+
+	httpd_uri_t _post_eq_settings_handler = {
+		.uri = "/api/eq/settings",
+		.method = HTTP_POST,
+		.handler = post_eq_settings_handler,
+	};
+	httpd_register_uri_handler(server, &_post_eq_settings_handler);
+
+	/* OPTIONS handlers for CORS preflight - EQ endpoints */
+	httpd_uri_t _options_eq_settings_handler = {
+		.uri = "/api/eq/settings",
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	httpd_register_uri_handler(server, &_options_eq_settings_handler);
+
+	httpd_uri_t _options_eq_schema_handler = {
+		.uri = "/api/eq/schema",
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	httpd_register_uri_handler(server, &_options_eq_schema_handler);
 #endif /* CONFIG_DAC_TAS5805M */
 
 	/* URI handler for static files (catch-all, must be last) */
@@ -965,6 +1150,13 @@ esp_err_t start_server(const char *base_path, int port) {
 				 __func__, esp_err_to_name(ret));
 	} else {
 		ESP_LOGI(TAG, "%s: Static file handler registered for /*", __func__);
+
+		/* Diagnostic: list all embedded files available at runtime */
+		ESP_LOGI(TAG, "%s: Embedded files: count=%zu", __func__, sizeof(embedded_files) / sizeof(embedded_file_t));
+		for (size_t i = 0; i < sizeof(embedded_files) / sizeof(embedded_file_t); ++i) {
+			size_t file_size = embedded_files[i].data_end - embedded_files[i].data_start;
+			ESP_LOGI(TAG, "%s: [%zu] uri=%s type=%s size=%zu", __func__, i, embedded_files[i].uri, embedded_files[i].content_type, file_size);
+		}
 	}
 
 	return ESP_OK;
