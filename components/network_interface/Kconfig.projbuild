@@ -305,4 +305,30 @@ menu "Wifi Configuration"
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
             Set to 0 if unlimited reconnections are preferred.
+
+    choice WIFI_POWER_SAVE_MODE
+        prompt "WiFi Power Save Mode"
+        default WIFI_PS_MIN_MODEM_MODE
+        help
+            Configure WiFi power saving mode. For real-time audio streaming,
+            disabling power save (NONE) provides lower latency but uses more power.
+
+        config WIFI_PS_NONE_MODE
+            bool "None (lowest latency, recommended for audio)"
+            help
+                WiFi radio is always on. Provides consistent low latency (1-5ms)
+                but uses ~100mA. Recommended for Snapcast audio streaming.
+
+        config WIFI_PS_MIN_MODEM_MODE
+            bool "Minimum Modem (balanced)"
+            help
+                WiFi radio sleeps between DTIM beacons. Saves ~20-30mA but can
+                add 20-100ms latency spikes. Default ESP-IDF behavior.
+
+        config WIFI_PS_MAX_MODEM_MODE
+            bool "Maximum Modem (most power saving)"
+            help
+                WiFi radio sleeps more aggressively. Maximum power saving but
+                can cause significant latency spikes. Not recommended for audio.
+    endchoice
 endmenu
