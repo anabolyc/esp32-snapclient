@@ -451,8 +451,10 @@ static bool eth_check_gateway_reachable(esp_netif_t *netif) {
     return true;  // No gateway to check - assume OK
   }
 
+  // Semaphore should be created in eth_start(), but check defensively
   if (!ping_done_sem) {
-    ping_done_sem = xSemaphoreCreateBinary();
+    ESP_LOGE(TAG, "Ping semaphore not initialized");
+    return false;
   }
   ping_success = false;
 
@@ -479,11 +481,14 @@ static bool eth_check_gateway_reachable(esp_netif_t *netif) {
 
   // Wait for ping to complete (max 5 seconds)
   if (xSemaphoreTake(ping_done_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
-    ESP_LOGW(TAG, "Ping timed out");
+    ESP_LOGW(TAG, "Ping timed out, forcing stop");
     ping_success = false;
   }
 
+  // Stop ping and wait for callbacks to complete before deleting session
+  // This prevents use-after-free if callbacks fire after session deletion
   esp_ping_stop(ping);
+  vTaskDelay(pdMS_TO_TICKS(100));  // Allow pending callbacks to complete
   esp_ping_delete_session(ping);
 
   if (ping_success) {
@@ -497,8 +502,13 @@ static bool eth_check_gateway_reachable(esp_netif_t *netif) {
 
 /**
  * @brief Apply static IP configuration from settings
+ *
+ * LOCKING CONTRACT: This function acquires connIpSemaphoreHandle internally
+ * at the end to update connection state. Caller MUST NOT hold the semaphore
+ * when calling this function to avoid deadlock.
+ *
  * @param netif The network interface to configure
- * @return ESP_OK on success
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if config invalid
  */
 static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
   char ip_str[16] = {0};
@@ -543,7 +553,10 @@ static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
   }
 
   // Stop DHCP client before setting static IP
-  esp_netif_dhcpc_stop(netif);
+  esp_err_t dhcp_err = esp_netif_dhcpc_stop(netif);
+  if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+    ESP_LOGD(TAG, "DHCP stop returned: %s (continuing)", esp_err_to_name(dhcp_err));
+  }
 
   // Apply static IP configuration
   esp_err_t err = esp_netif_set_ip_info(netif, &static_ip_info);
@@ -592,15 +605,26 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
   if (want_eth_takeover && !we_changed_default_netif && !playerstarted) {
     do_takeover = true;
-    we_changed_default_netif = true;
     want_eth_takeover = false;
+    // Don't set we_changed_default_netif until after successful netif change
   }
   xSemaphoreGive(connIpSemaphoreHandle);
 
   if (do_takeover) {
     ESP_LOGI(TAG, "Ethernet takeover: setting default netif to ETH");
-    esp_netif_set_default_netif(netif);
-    app_request_reconnect();
+    esp_err_t err = esp_netif_set_default_netif(netif);
+    if (err == ESP_OK) {
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      we_changed_default_netif = true;
+      xSemaphoreGive(connIpSemaphoreHandle);
+      app_request_reconnect();
+    } else {
+      ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
+      // Restore takeover intent so it can be retried
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      want_eth_takeover = true;
+      xSemaphoreGive(connIpSemaphoreHandle);
+    }
   } else if (want_eth_takeover && playerstarted) {
     ESP_LOGI(TAG, "Playback active; deferring Ethernet takeover until playback stops");
   }
@@ -801,6 +825,11 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 
       break;
     case ETHERNET_EVENT_DISCONNECTED:
+      // Defensive check - semaphore should be created in eth_start()
+      if (!connIpSemaphoreHandle) {
+        ESP_LOGE(TAG, "Semaphore not initialized in disconnect handler");
+        break;
+      }
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       connected = false;
 
@@ -817,7 +846,10 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
       static_ip_netif = NULL;
 
       // Stop any running DHCP client to avoid confusion
-      esp_netif_dhcpc_stop(netif);
+      esp_err_t dhcp_err = esp_netif_dhcpc_stop(netif);
+      if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGD(TAG, "DHCP stop returned: %s", esp_err_to_name(dhcp_err));
+      }
 
       /* If we previously changed the default netif to prefer Ethernet, reset
        * the flag and trigger a reconnect so the system falls back to WiFi.
@@ -922,6 +954,12 @@ bool eth_get_ip(esp_netif_ip_info_t *ip) {
  * Ethernet takeover that was delayed during active playback.
  */
 void eth_on_playback_stopped(void) {
+  // Defensive check - semaphore should be created in eth_start()
+  if (!connIpSemaphoreHandle) {
+    ESP_LOGD(TAG, "eth_on_playback_stopped: semaphore not initialized (Ethernet disabled?)");
+    return;
+  }
+
   bool do_takeover = false;
   bool do_static_ip = false;
   esp_netif_t *pending_netif = NULL;
@@ -977,11 +1015,15 @@ void eth_on_playback_stopped(void) {
     ESP_LOGI(TAG, "Playback stopped: performing pending Ethernet takeover");
     esp_netif_t *eth_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_ETH);
     if (eth_netif) {
-      esp_netif_set_default_netif(eth_netif);
-      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-      we_changed_default_netif = true;
-      xSemaphoreGive(connIpSemaphoreHandle);
-      app_request_reconnect();
+      esp_err_t err = esp_netif_set_default_netif(eth_netif);
+      if (err == ESP_OK) {
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        we_changed_default_netif = true;
+        xSemaphoreGive(connIpSemaphoreHandle);
+        app_request_reconnect();
+      } else {
+        ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
+      }
     } else {
       ESP_LOGW(TAG, "Playback-stopped takeover: ETH netif not found");
     }
@@ -1004,9 +1046,13 @@ static void eth_on_got_ipv6(void *arg, esp_event_base_t event_base,
 
 /** Init function that exposes to the main application */
 void eth_start(void) {
-  // Initialize semaphore first (needed even if Ethernet is disabled)
+  // Initialize semaphores first (needed even if Ethernet is disabled)
   if (!connIpSemaphoreHandle) {
     connIpSemaphoreHandle = xSemaphoreCreateMutex();
+  }
+  // Create ping semaphore once here to avoid leak from repeated creation
+  if (!ping_done_sem) {
+    ping_done_sem = xSemaphoreCreateBinary();
   }
 
   // Check Ethernet mode from settings
