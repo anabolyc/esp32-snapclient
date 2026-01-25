@@ -196,6 +196,8 @@ void wifi_start(void) {
   esp_wifi_netif = esp_netif_create_wifi(WIFI_IF_STA, &esp_netif_config);
   esp_wifi_set_default_wifi_sta_handlers();
 
+  // esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  //   esp_wifi_set_ps(WIFI_PS_NONE);
 
 #if ENABLE_WIFI_PROVISIONING
   /* Start Wi-Fi station */
@@ -219,16 +221,6 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
-
-  // Set WiFi power save mode based on menuconfig setting
-#if defined(CONFIG_WIFI_PS_NONE_MODE)
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-  ESP_LOGI(TAG, "WiFi power save disabled for low latency");
-#elif defined(CONFIG_WIFI_PS_MAX_MODEM_MODE)
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
-#else
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-#endif
 
   ESP_LOGI(TAG, "Starting provisioning");
 
@@ -271,16 +263,6 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
-
-  // Set WiFi power save mode based on menuconfig setting
-#if defined(CONFIG_WIFI_PS_NONE_MODE)
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-  ESP_LOGI(TAG, "WiFi power save disabled for low latency");
-#elif defined(CONFIG_WIFI_PS_MAX_MODEM_MODE)
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
-#else
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-#endif
 
   ESP_LOGI(TAG, "wifi_init_sta finished. Trying to connect to %s",
            wifi_config.sta.ssid);
