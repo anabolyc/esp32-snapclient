@@ -46,6 +46,14 @@ static bool want_eth_takeover = false;
 // Ethernet mode: 0=Disabled (default), 1=DHCP, 2=Static
 static int32_t current_eth_mode = 0;
 
+/* State guards for static IP application (Fix 3) */
+static bool static_ip_in_progress = false;
+static bool static_ip_pending = false;
+static esp_netif_t *static_ip_netif = NULL;  // netif for pending static IP
+
+/* Forward declaration for reconnect request */
+extern void app_request_reconnect(void);
+
 /**
  * @brief Cleanup Ethernet drivers and free handles on initialization failure
  */
@@ -563,6 +571,126 @@ static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
   return ESP_OK;
 }
 
+/**
+ * @brief Unified takeover checkpoint - called from ALL IP acquisition paths (Fix 1)
+ *
+ * Checks if conditions are met for Ethernet takeover and performs it atomically.
+ * This ensures consistent behavior whether IP was acquired via DHCP or static config.
+ *
+ * @param netif The Ethernet network interface that now has an IP
+ */
+static void eth_check_and_apply_takeover(esp_netif_t *netif) {
+  bool do_takeover = false;
+
+  xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+  if (want_eth_takeover && !we_changed_default_netif && !playerstarted) {
+    do_takeover = true;
+    we_changed_default_netif = true;
+    want_eth_takeover = false;
+  }
+  xSemaphoreGive(connIpSemaphoreHandle);
+
+  if (do_takeover) {
+    ESP_LOGI(TAG, "Ethernet takeover: setting default netif to ETH");
+    esp_netif_set_default_netif(netif);
+    app_request_reconnect();
+  } else if (want_eth_takeover && playerstarted) {
+    ESP_LOGI(TAG, "Playback active; deferring Ethernet takeover until playback stops");
+  }
+}
+
+/**
+ * @brief Background task for static IP configuration (Fix 2)
+ *
+ * Moves blocking static IP operations out of the event handler to prevent
+ * blocking other Ethernet events. The task handles:
+ * - Link stabilization delay
+ * - Static IP application
+ * - Gateway reachability check
+ * - Takeover coordination
+ *
+ * @param pvParameters The esp_netif_t* for the Ethernet interface
+ */
+static void static_ip_task(void *pvParameters) {
+  esp_netif_t *netif = (esp_netif_t *)pvParameters;
+
+  ESP_LOGI(TAG, "Static IP task started");
+
+  // Check if we should abort (disconnected while waiting to start)
+  xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+  if (!static_ip_in_progress) {
+    ESP_LOGW(TAG, "Static IP task: aborted (flag cleared)");
+    xSemaphoreGive(connIpSemaphoreHandle);
+    vTaskDelete(NULL);
+    return;
+  }
+  xSemaphoreGive(connIpSemaphoreHandle);
+
+  // Wait for link to stabilize
+  vTaskDelay(pdMS_TO_TICKS(500));
+
+  // Check again if we should continue (cable might have been unplugged)
+  xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+  if (!static_ip_in_progress) {
+    ESP_LOGW(TAG, "Static IP task: aborted after link delay");
+    xSemaphoreGive(connIpSemaphoreHandle);
+    vTaskDelete(NULL);
+    return;
+  }
+  xSemaphoreGive(connIpSemaphoreHandle);
+
+  // Apply static IP configuration
+  esp_err_t result = eth_apply_static_ip(netif);
+
+  if (result == ESP_OK) {
+    // Give time for IP to be applied before checking gateway
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Check if still valid
+    xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+    bool still_valid = static_ip_in_progress && connected;
+    xSemaphoreGive(connIpSemaphoreHandle);
+
+    if (!still_valid) {
+      ESP_LOGW(TAG, "Static IP task: aborted after IP apply");
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      static_ip_in_progress = false;
+      xSemaphoreGive(connIpSemaphoreHandle);
+      vTaskDelete(NULL);
+      return;
+    }
+
+    // Check gateway reachability
+    if (!eth_check_gateway_reachable(netif)) {
+      ESP_LOGW(TAG, "Static IP failed gateway check, falling back to DHCP");
+
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      connected = false;
+      static_ip_in_progress = false;
+      xSemaphoreGive(connIpSemaphoreHandle);
+
+      // Start DHCP - GOT_IP event will handle takeover
+      esp_netif_dhcpc_start(netif);
+    } else {
+      // Static IP succeeded - apply takeover using unified checkpoint
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      static_ip_in_progress = false;
+      xSemaphoreGive(connIpSemaphoreHandle);
+
+      eth_check_and_apply_takeover(netif);
+      ESP_LOGI(TAG, "Static IP configuration complete");
+    }
+  } else {
+    // Static IP configuration failed, DHCP should already be running
+    ESP_LOGW(TAG, "Static IP configuration failed, using DHCP");
+    xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+    static_ip_in_progress = false;
+    xSemaphoreGive(connIpSemaphoreHandle);
+  }
+
+  vTaskDelete(NULL);
+}
+
 /** Event handler for Ethernet events */
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data) {
@@ -594,48 +722,46 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Ethernet present and WiFi active; will prefer Ethernet after IP acquired");
       }
 
-      // Handle static IP mode
+      // Handle static IP mode (Fix 2: spawn task instead of blocking)
       if (current_eth_mode == 2) {  // Static
-        // Wait for link to stabilize
-        vTaskDelay(pdMS_TO_TICKS(500));
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
 
-        // Apply static IP configuration
-        if (eth_apply_static_ip(netif) == ESP_OK) {
-          // Give time for IP to be applied before checking gateway
-          vTaskDelay(pdMS_TO_TICKS(500));
+        // Fix 3: Check state guards
+        if (static_ip_in_progress) {
+          ESP_LOGW(TAG, "Static IP already in progress, ignoring duplicate connect event");
+          xSemaphoreGive(connIpSemaphoreHandle);
+          break;
+        }
 
-          // Check gateway reachability
-          if (!eth_check_gateway_reachable(netif)) {
-            ESP_LOGW(TAG, "Static IP failed gateway check, falling back to DHCP");
-            // Clear connected state
-            xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-            connected = false;
-            xSemaphoreGive(connIpSemaphoreHandle);
-            // Start DHCP
-            esp_netif_dhcpc_start(netif);
-            // connected flag will be set by got_ip_event_handler when DHCP succeeds
-          } else {
-            // Static IP succeeded and gateway is reachable
-            // Handle takeover if WiFi was active (static IP doesn't trigger GOT_IP event)
-            bool do_takeover = false;
-            xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-            if (want_eth_takeover && !we_changed_default_netif && !playerstarted) {
-              do_takeover = true;
-              we_changed_default_netif = true;
-              want_eth_takeover = false;
-            }
-            xSemaphoreGive(connIpSemaphoreHandle);
+        // Fix 4: Check if playback is active - defer if so
+        if (playerstarted) {
+          ESP_LOGI(TAG, "Playback active; deferring static IP until playback stops");
+          static_ip_pending = true;
+          static_ip_netif = netif;
+          xSemaphoreGive(connIpSemaphoreHandle);
+          break;
+        }
 
-            if (do_takeover) {
-              ESP_LOGI(TAG, "Static IP: Preferring Ethernet, setting default netif");
-              esp_netif_set_default_netif(netif);
-              extern void app_request_reconnect(void);
-              app_request_reconnect();
-            }
-          }
-        } else {
-          // Static IP configuration failed, DHCP is already running
-          ESP_LOGW(TAG, "Static IP configuration failed, using DHCP");
+        static_ip_in_progress = true;
+        static_ip_pending = false;
+        xSemaphoreGive(connIpSemaphoreHandle);
+
+        // Spawn task to handle static IP in background (doesn't block event handler)
+        BaseType_t task_created = xTaskCreate(
+            static_ip_task,
+            "eth_static_ip",
+            4096,
+            (void *)netif,
+            5,
+            NULL
+        );
+
+        if (task_created != pdPASS) {
+          ESP_LOGE(TAG, "Failed to create static IP task, falling back to DHCP");
+          xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+          static_ip_in_progress = false;
+          xSemaphoreGive(connIpSemaphoreHandle);
+          // DHCP will be started by default
         }
       }
       // DHCP mode (current_eth_mode == 1): takeover will be handled in got_ip_event_handler
@@ -644,6 +770,14 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
     case ETHERNET_EVENT_DISCONNECTED:
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       connected = false;
+
+      // Fix 5: Reset static IP state guards on disconnect
+      static_ip_in_progress = false;  // Abort any running static IP task
+      static_ip_pending = false;
+      static_ip_netif = NULL;
+
+      // Stop any running DHCP client to avoid confusion
+      esp_netif_dhcpc_stop(netif);
 
       /* If we previously changed the default netif to prefer Ethernet, reset
        * the flag and trigger a reconnect so the system falls back to WiFi.
@@ -654,9 +788,9 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         want_eth_takeover = false;
         xSemaphoreGive(connIpSemaphoreHandle);
         /* Request reconnect so main re-evaluates network and uses WiFi */
-        extern void app_request_reconnect(void);
         app_request_reconnect();
       } else {
+        want_eth_takeover = false;  // Clear any pending takeover intent
         xSemaphoreGive(connIpSemaphoreHandle);
       }
 
@@ -727,30 +861,10 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
       ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info.gw));
       ESP_LOGI(TAG, "~~~~~~~~~~~");
 
-      /* If we previously detected that WiFi was active and we wanted to
-       * prefer Ethernet, set the default netif to Ethernet now that it has
-       * an IP. Respect active playback to avoid interruptions.
-       */
-      if (want_eth_takeover && !we_changed_default_netif) {
-        if (!playerstarted) {
-          ESP_LOGI(TAG, "Preferring Ethernet: setting default netif to ETH (no active playback)");
-          esp_netif_set_default_netif(event->esp_netif);
-          we_changed_default_netif = true;
-          want_eth_takeover = false;
-          /* Request main to reconnect so the snapclient binds to the preferred
-           * interface (ETH) for the next connection cycle.
-           */
-          extern void app_request_reconnect(void);
-          app_request_reconnect();
-        } else {
-          ESP_LOGI(TAG, "Playback in progress; will complete Ethernet takeover when playback stops");
-          /* Keep want_eth_takeover = true so eth_on_playback_stopped() can
-           * complete the takeover later.
-           */
-        }
-      }
-
       xSemaphoreGive(connIpSemaphoreHandle);
+
+      /* Use unified takeover checkpoint (Fix 1) - handles playback check internally */
+      eth_check_and_apply_takeover(event->esp_netif);
 
       break;
     }
@@ -777,27 +891,56 @@ bool eth_get_ip(esp_netif_ip_info_t *ip) {
  */
 void eth_on_playback_stopped(void) {
   bool do_takeover = false;
+  bool do_static_ip = false;
+  esp_netif_t *pending_netif = NULL;
 
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-  if (want_eth_takeover && connected && !we_changed_default_netif) {
+
+  // Fix 4: Check for pending static IP configuration first
+  if (static_ip_pending && static_ip_netif && !static_ip_in_progress) {
+    do_static_ip = true;
+    pending_netif = static_ip_netif;
+    static_ip_pending = false;
+    static_ip_in_progress = true;
+  }
+  // Check for pending takeover (DHCP path or already-configured static IP)
+  else if (want_eth_takeover && connected && !we_changed_default_netif) {
     do_takeover = true;
-    /* consume the takeover request; we'll set we_changed_default_netif if succeed */
     want_eth_takeover = false;
   }
+
   xSemaphoreGive(connIpSemaphoreHandle);
 
+  // Handle pending static IP configuration
+  if (do_static_ip) {
+    ESP_LOGI(TAG, "Playback stopped: starting deferred static IP configuration");
+    BaseType_t task_created = xTaskCreate(
+        static_ip_task,
+        "eth_static_ip",
+        4096,
+        (void *)pending_netif,
+        5,
+        NULL
+    );
+
+    if (task_created != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create deferred static IP task");
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      static_ip_in_progress = false;
+      xSemaphoreGive(connIpSemaphoreHandle);
+    }
+    return;
+  }
+
+  // Handle pending takeover
   if (do_takeover) {
-    ESP_LOGI(TAG, "Playback stopped: performing pending Ethernet takeover (prefer ETH)");
+    ESP_LOGI(TAG, "Playback stopped: performing pending Ethernet takeover");
     esp_netif_t *eth_netif = network_get_netif_from_desc(NETWORK_INTERFACE_DESC_ETH);
     if (eth_netif) {
       esp_netif_set_default_netif(eth_netif);
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       we_changed_default_netif = true;
       xSemaphoreGive(connIpSemaphoreHandle);
-      /* Request main to reconnect so the snapclient binds to the preferred
-       * interface (ETH) for the next connection cycle.
-       */
-      extern void app_request_reconnect(void);
       app_request_reconnect();
     } else {
       ESP_LOGW(TAG, "Playback-stopped takeover: ETH netif not found");
