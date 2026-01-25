@@ -40,23 +40,53 @@ extern bool playerstarted;
 
 static const char *TAG = "ETH_IF";
 
+/* ============ Timing Constants ============ */
+#define ETH_LINK_STABILIZATION_MS     500   // Wait for link to stabilize after connect
+#define ETH_STATIC_IP_SETTLE_MS       500   // Wait after applying static IP before gateway check
+#define ETH_PING_CALLBACK_CLEANUP_MS  100   // Wait for ping callbacks to complete after stop
+#define ETH_GATEWAY_PING_COUNT        3     // Number of ping attempts for gateway check
+#define ETH_GATEWAY_PING_TIMEOUT_MS   1000  // Timeout per ping attempt
+#define ETH_GATEWAY_CHECK_TIMEOUT_MS  5000  // Overall timeout for gateway reachability check
+#define ETH_STATIC_IP_TASK_STACK      4096  // Stack size for static IP background task
+#define ETH_STATIC_IP_TASK_PRIORITY   5     // Priority for static IP background task
+
+/* ============ State Variables ============ */
 static uint8_t eth_port_cnt = 0;
 
 static esp_netif_ip_info_t ip_info = {{0}, {0}, {0}};
 static bool connected = false;
 static SemaphoreHandle_t connIpSemaphoreHandle = NULL;
-/* Track takeover intent and whether we changed the default netif to prefer Ethernet */
+
+/*
+ * Takeover State Machine:
+ * - want_eth_takeover: Set when Ethernet connects while WiFi has IP. Cleared
+ *   when takeover completes OR on disconnect (but preserved on brief disconnect
+ *   if we never completed takeover).
+ * - we_changed_default_netif: Set after successfully changing default netif to
+ *   Ethernet. Used to trigger WiFi fallback on disconnect.
+ */
 static bool we_changed_default_netif = false;
 static bool want_eth_takeover = false;
 
-// Ethernet mode: 0=Disabled (default), 1=DHCP, 2=Static
+/* Ethernet mode: 0=Disabled (default), 1=DHCP, 2=Static */
 static int32_t current_eth_mode = 0;
 
-/* State guards for static IP application */
+/*
+ * Static IP State Guards:
+ * - static_ip_in_progress: Task is running, prevents re-entry
+ * - static_ip_pending: Deferred due to active playback, will start when playback stops
+ * - static_ip_netif: Protected pointer to netif for task to use
+ * - static_ip_task_handle: Handle for cleanup on disconnect
+ *
+ * Valid states: (in_progress=F, pending=F) = idle
+ *               (in_progress=F, pending=T) = waiting for playback to stop
+ *               (in_progress=T, pending=F) = task running
+ *               (in_progress=T, pending=T) = INVALID
+ */
 static bool static_ip_in_progress = false;
 static bool static_ip_pending = false;
-static esp_netif_t *static_ip_netif = NULL;  // Protected netif pointer for static IP task
-static TaskHandle_t static_ip_task_handle = NULL;  // Track task for cleanup on disconnect
+static esp_netif_t *static_ip_netif = NULL;
+static TaskHandle_t static_ip_task_handle = NULL;
 
 /* Forward declaration for reconnect request */
 extern void app_request_reconnect(void);
@@ -338,6 +368,14 @@ err:
 #endif  // CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
 
 /**
+ * @brief Initialize Ethernet hardware drivers
+ *
+ * Creates and configures Ethernet driver instances for all configured
+ * Ethernet interfaces (internal EMAC and/or SPI-based).
+ *
+ * @param[out] eth_handles_out Pointer to receive allocated array of Ethernet handles
+ * @param[out] eth_cnt_out Pointer to receive count of initialized interfaces
+ * @return ESP_OK on success, error code on failure
  */
 static esp_err_t eth_init(esp_eth_handle_t *eth_handles_out[],
                           uint8_t *eth_cnt_out) {
@@ -461,8 +499,8 @@ static bool eth_check_gateway_reachable(esp_netif_t *netif) {
   esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
   ping_config.target_addr.u_addr.ip4.addr = ip.gw.addr;
   ping_config.target_addr.type = ESP_IPADDR_TYPE_V4;
-  ping_config.count = 3;           // 3 attempts
-  ping_config.timeout_ms = 1000;   // 1 second per attempt
+  ping_config.count = ETH_GATEWAY_PING_COUNT;
+  ping_config.timeout_ms = ETH_GATEWAY_PING_TIMEOUT_MS;
   ping_config.interface = esp_netif_get_netif_impl_index(netif);
 
   esp_ping_callbacks_t cbs = {
@@ -479,8 +517,8 @@ static bool eth_check_gateway_reachable(esp_netif_t *netif) {
 
   esp_ping_start(ping);
 
-  // Wait for ping to complete (max 5 seconds)
-  if (xSemaphoreTake(ping_done_sem, pdMS_TO_TICKS(5000)) != pdTRUE) {
+  // Wait for ping to complete
+  if (xSemaphoreTake(ping_done_sem, pdMS_TO_TICKS(ETH_GATEWAY_CHECK_TIMEOUT_MS)) != pdTRUE) {
     ESP_LOGW(TAG, "Ping timed out, forcing stop");
     ping_success = false;
   }
@@ -488,7 +526,7 @@ static bool eth_check_gateway_reachable(esp_netif_t *netif) {
   // Stop ping and wait for callbacks to complete before deleting session
   // This prevents use-after-free if callbacks fire after session deletion
   esp_ping_stop(ping);
-  vTaskDelay(pdMS_TO_TICKS(100));  // Allow pending callbacks to complete
+  vTaskDelay(pdMS_TO_TICKS(ETH_PING_CALLBACK_CLEANUP_MS));
   esp_ping_delete_session(ping);
 
   if (ping_success) {
@@ -541,7 +579,8 @@ static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
       return ESP_ERR_INVALID_ARG;
     }
   } else {
-    // Default netmask
+    // Default netmask - warn user since it may not be appropriate for all networks
+    ESP_LOGW(TAG, "No netmask configured, using default 255.255.255.0 (/24)");
     inet_pton(AF_INET, "255.255.255.0", &static_ip_info.netmask);
   }
 
@@ -664,7 +703,7 @@ static void static_ip_task(void *pvParameters) {
   xSemaphoreGive(connIpSemaphoreHandle);
 
   // Wait for link to stabilize
-  vTaskDelay(pdMS_TO_TICKS(500));
+  vTaskDelay(pdMS_TO_TICKS(ETH_LINK_STABILIZATION_MS));
 
   // Check again if we should continue (cable might have been unplugged)
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
@@ -682,7 +721,7 @@ static void static_ip_task(void *pvParameters) {
 
   if (result == ESP_OK) {
     // Give time for IP to be applied before checking gateway
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(ETH_STATIC_IP_SETTLE_MS));
 
     // Check if still valid
     xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
@@ -757,7 +796,12 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 
       esp_err_t ipv6_err = esp_netif_create_ip6_linklocal(netif);
       if (ipv6_err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to create IPv6 link-local: %s (continuing)", esp_err_to_name(ipv6_err));
+        // ESP_ERR_ESP_NETIF_IF_NOT_READY is expected during link negotiation
+        if (ipv6_err == ESP_ERR_ESP_NETIF_IF_NOT_READY) {
+          ESP_LOGD(TAG, "IPv6 link-local: interface not ready yet (normal during link-up)");
+        } else {
+          ESP_LOGW(TAG, "Failed to create IPv6 link-local: %s (continuing)", esp_err_to_name(ipv6_err));
+        }
       }
 
       // Check if WiFi is currently up - if so, plan to prefer Ethernet once
@@ -801,9 +845,9 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         BaseType_t task_created = xTaskCreate(
             static_ip_task,
             "eth_static_ip",
-            4096,
+            ETH_STATIC_IP_TASK_STACK,
             NULL,  // Task uses protected static_ip_netif instead
-            5,
+            ETH_STATIC_IP_TASK_PRIORITY,
             &static_ip_task_handle
         );
 
@@ -857,12 +901,16 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
       if (we_changed_default_netif) {
         ESP_LOGI(TAG, "Ethernet disconnected; triggering WiFi fallback");
         we_changed_default_netif = false;
-        want_eth_takeover = false;
+        want_eth_takeover = false;  // Clear intent - we completed takeover and now falling back
         xSemaphoreGive(connIpSemaphoreHandle);
         /* Request reconnect so main re-evaluates network and uses WiFi */
         app_request_reconnect();
       } else {
-        want_eth_takeover = false;  // Clear any pending takeover intent
+        /* Preserve want_eth_takeover on brief disconnect - if Ethernet reconnects
+         * quickly, we still want to complete the takeover. Only clear if we
+         * actually completed takeover (handled above).
+         */
+        ESP_LOGD(TAG, "Ethernet disconnected before takeover completed, preserving intent");
         xSemaphoreGive(connIpSemaphoreHandle);
       }
 
@@ -936,6 +984,12 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 /**
+ * @brief Get Ethernet IP information and connection status
+ *
+ * Thread-safe function to retrieve current Ethernet IP configuration.
+ *
+ * @param[out] ip Pointer to receive IP info (can be NULL to just check status)
+ * @return true if Ethernet is connected with valid IP, false otherwise
  */
 bool eth_get_ip(esp_netif_ip_info_t *ip) {
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
@@ -987,9 +1041,9 @@ void eth_on_playback_stopped(void) {
     BaseType_t task_created = xTaskCreate(
         static_ip_task,
         "eth_static_ip",
-        4096,
+        ETH_STATIC_IP_TASK_STACK,
         NULL,  // Task uses protected static_ip_netif instead
-        5,
+        ETH_STATIC_IP_TASK_PRIORITY,
         &static_ip_task_handle
     );
 
@@ -1130,7 +1184,9 @@ void eth_start(void) {
       snprintf(if_desc_str, sizeof(if_desc_str), "%s%d", NETWORK_INTERFACE_DESC_ETH, i);
       esp_netif_config.if_key = if_key_str;
       esp_netif_config.if_desc = if_desc_str;
-      esp_netif_config.route_prio -= i * 5;
+      // Decrease route priority for each subsequent interface, with underflow protection
+      int new_prio = (int)esp_netif_config.route_prio - (i * 5);
+      esp_netif_config.route_prio = (new_prio > 0) ? new_prio : 1;
       eth_netif = esp_netif_new(&cfg_spi);
 
       if (!eth_netif) {
