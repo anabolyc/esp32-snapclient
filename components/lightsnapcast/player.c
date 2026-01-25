@@ -104,6 +104,7 @@ static void player_task(void *pvParameters);
 
 bool gotSettings = false;
 bool playerstarted = false;
+static bool player_shutdown_in_progress = false;  // Guards against restart during shutdown
 
 extern void audio_set_mute(bool mute);
 extern void audio_dac_enable(bool enabled);
@@ -486,6 +487,8 @@ int start_player(snapcastSetting_t *setting) {
     if (playerstarted){
         return -1;
     }
+    // Clear shutdown flag - we're starting a new session
+    player_shutdown_in_progress = false;
     playerstarted = true;
     if (network_playback_started() != ESP_OK) {
         ESP_LOGW(TAG, "Failed to signal playback started to network layer");
@@ -1227,6 +1230,13 @@ int32_t insert_pcm_chunk(pcm_chunk_message_t *pcmChunk) {
     ESP_LOGW(TAG, "pcm chunk queue not created. Player started: %s", playerstarted ? "True": "False");
 
     free_pcm_chunk(pcmChunk);
+
+    // Don't try to restart player if shutdown is in progress (prevents race condition
+    // where we try to start player while it's still cleaning up)
+    if (player_shutdown_in_progress) {
+        ESP_LOGD(TAG, "Player shutdown in progress, not restarting");
+        return -2;
+    }
 
     snapcastSetting_t curSet;
     player_get_snapcast_settings(&curSet);
@@ -1990,6 +2000,10 @@ static void player_task(void *pvParameters) {
     }
   }
   ret = 0;
+
+  // Set shutdown flag BEFORE destroying resources to prevent insert_pcm_chunk
+  // from trying to restart the player during cleanup
+  player_shutdown_in_progress = true;
 
   xSemaphoreTake(snapcastSettingsMux, portMAX_DELAY);
   // delete the queue
