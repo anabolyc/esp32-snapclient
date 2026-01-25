@@ -616,14 +616,19 @@ static void http_get_task(void *pvParameters) {
       if (staUp) {
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-        // WiFi is up but Ethernet isn't - wait a bit for Ethernet
-        if (eth_wait_count < ETH_WAIT_MAX) {
-          ESP_LOGI(TAG, "WiFi up, waiting for Ethernet (%d/%d)...", eth_wait_count + 1, ETH_WAIT_MAX);
-          eth_wait_count++;
-          vTaskDelay(pdMS_TO_TICKS(1000));
-          continue;
+        // Only wait for Ethernet if it's enabled in settings
+        int32_t eth_mode = 0;
+        settings_get_eth_mode(&eth_mode);
+        if (eth_mode > 0) {
+          // WiFi is up but Ethernet isn't - wait a bit for Ethernet
+          if (eth_wait_count < ETH_WAIT_MAX) {
+            ESP_LOGI(TAG, "WiFi up, waiting for Ethernet (%d/%d)...", eth_wait_count + 1, ETH_WAIT_MAX);
+            eth_wait_count++;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+          }
+          ESP_LOGW(TAG, "Ethernet not available, falling back to WiFi");
         }
-        ESP_LOGW(TAG, "Ethernet not available, falling back to WiFi");
 #endif
         netif = sta_netif;
         ESP_LOGI(TAG, "Using WiFi interface");
