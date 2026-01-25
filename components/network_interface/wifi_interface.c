@@ -70,6 +70,27 @@ static char mac_address[18];
 
 static int s_retry_num = 0;
 
+/* Get the configured idle power save mode from menuconfig */
+static wifi_ps_type_t get_configured_power_save_mode(void) {
+#if defined(CONFIG_WIFI_PS_NONE_MODE)
+    return WIFI_PS_NONE;
+#elif defined(CONFIG_WIFI_PS_MAX_MODEM_MODE)
+    return WIFI_PS_MAX_MODEM;
+#else
+    return WIFI_PS_MIN_MODEM;
+#endif
+}
+
+/* Apply initial power save setting and log it */
+static void apply_initial_power_save(void) {
+    wifi_ps_type_t ps_mode = get_configured_power_save_mode();
+    ESP_ERROR_CHECK(esp_wifi_set_ps(ps_mode));
+
+    const char *mode_str = (ps_mode == WIFI_PS_NONE) ? "NONE (low latency)" :
+                           (ps_mode == WIFI_PS_MAX_MODEM) ? "MAX_MODEM" : "MIN_MODEM";
+    ESP_LOGI(TAG, "WiFi power save mode: %s", mode_str);
+}
+
 static esp_netif_t *esp_wifi_netif = NULL;
 
 static esp_netif_ip_info_t ip_info = {{0}, {0}, {0}};
@@ -196,9 +217,6 @@ void wifi_start(void) {
   esp_wifi_netif = esp_netif_create_wifi(WIFI_IF_STA, &esp_netif_config);
   esp_wifi_set_default_wifi_sta_handlers();
 
-  // esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-  //   esp_wifi_set_ps(WIFI_PS_NONE);
-
 #if ENABLE_WIFI_PROVISIONING
   /* Start Wi-Fi station */
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -221,6 +239,7 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  apply_initial_power_save();
 
   ESP_LOGI(TAG, "Starting provisioning");
 
@@ -263,8 +282,33 @@ void wifi_start(void) {
                                              &lost_ip_event_handler, NULL));
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  apply_initial_power_save();
 
   ESP_LOGI(TAG, "wifi_init_sta finished. Trying to connect to %s",
            wifi_config.sta.ssid);
+#endif
+}
+
+/**
+ * Set WiFi power save mode dynamically.
+ * Call with enable=false during playback for better throughput,
+ * call with enable=true when idle to save power.
+ */
+void wifi_set_power_save(bool enable) {
+#if defined(CONFIG_WIFI_DYNAMIC_POWER_SAVE)
+    wifi_ps_type_t ps_mode;
+    if (enable) {
+        ps_mode = get_configured_power_save_mode();
+        ESP_LOGI(TAG, "WiFi power save enabled");
+    } else {
+        ps_mode = WIFI_PS_NONE;
+        ESP_LOGI(TAG, "WiFi power save disabled for playback");
+    }
+    esp_err_t err = esp_wifi_set_ps(ps_mode);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set WiFi power save: %s", esp_err_to_name(err));
+    }
+#else
+    (void)enable;  // Power save mode is static, ignore request
 #endif
 }

@@ -101,6 +101,10 @@ esp_err_t network_playback_started(void) {
     }
     xEventGroupSetBits(network_event_group, EVENT_PLAYBACK_STARTED_BIT);
     xEventGroupClearBits(network_event_group, EVENT_PLAYBACK_STOPPED_BIT);
+
+    // Disable WiFi power save during playback for better throughput
+    wifi_set_power_save(false);
+
     return ESP_OK;
 }
 
@@ -111,6 +115,10 @@ esp_err_t network_playback_stopped(void) {
     }
     xEventGroupSetBits(network_event_group, EVENT_PLAYBACK_STOPPED_BIT);
     xEventGroupClearBits(network_event_group, EVENT_PLAYBACK_STARTED_BIT);
+
+    // Re-enable WiFi power save when idle
+    wifi_set_power_save(true);
+
     return ESP_OK;
 }
 

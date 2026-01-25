@@ -21,4 +21,12 @@
 bool wifi_get_ip(esp_netif_ip_info_t *ip);
 void wifi_start(void);
 
+/**
+ * Dynamically enable/disable WiFi power save.
+ * Call with enable=false during audio playback for better throughput.
+ * Call with enable=true when idle to save power.
+ * Only effective if CONFIG_WIFI_DYNAMIC_POWER_SAVE is enabled.
+ */
+void wifi_set_power_save(bool enable);
+
 #endif /* _WIFI_INTERFACE_H_ */

@@ -305,4 +305,39 @@ menu "Wifi Configuration"
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
             Set to 0 if unlimited reconnections are preferred.
+
+    choice WIFI_POWER_SAVE_MODE
+        prompt "WiFi Power Save Mode (when idle)"
+        default WIFI_PS_MIN_MODEM_MODE
+        help
+            Configure WiFi power saving mode when audio is not playing.
+            During playback, power save is automatically disabled for best throughput.
+
+        config WIFI_PS_NONE_MODE
+            bool "None (always low latency)"
+            help
+                WiFi radio is always on. Provides consistent low latency (1-5ms)
+                but uses ~100mA continuously.
+
+        config WIFI_PS_MIN_MODEM_MODE
+            bool "Minimum Modem (balanced, recommended)"
+            help
+                WiFi radio sleeps between DTIM beacons when idle. Saves ~20-30mA.
+                Power save is disabled during playback for best audio quality.
+
+        config WIFI_PS_MAX_MODEM_MODE
+            bool "Maximum Modem (most power saving)"
+            help
+                WiFi radio sleeps more aggressively when idle. Maximum power saving.
+                Power save is disabled during playback for best audio quality.
+    endchoice
+
+    config WIFI_DYNAMIC_POWER_SAVE
+        bool "Disable power save during playback"
+        default y
+        depends on !WIFI_PS_NONE_MODE
+        help
+            Automatically disable WiFi power save when audio is playing to
+            improve throughput and reduce latency. Re-enables power save
+            when playback stops to conserve power.
 endmenu
