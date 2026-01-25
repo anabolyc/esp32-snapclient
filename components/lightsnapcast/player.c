@@ -1622,6 +1622,12 @@ static void player_task(void *pvParameters) {
 
           my_i2s_channel_disable(tx_chan);
 
+          // Yield to let HTTP task receive new chunks from network
+          // Only yield if queue is empty - otherwise rely on existing discard logic
+          if (uxQueueMessagesWaiting(pcmChkQHdl) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+          }
+
           continue;
         }
       }
