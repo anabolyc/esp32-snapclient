@@ -464,7 +464,15 @@ static esp_err_t _wifi_init(esp_periph_handle_t self) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+#if defined(CONFIG_WIFI_PS_NONE_MODE)
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG, "WiFi power save disabled for low latency");
+#elif defined(CONFIG_WIFI_PS_MAX_MODEM_MODE)
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
+    ESP_LOGI(TAG, "WiFi power save set to MAX_MODEM");
+#else
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
+#endif
   }
   if (periph_wifi->wpa2_e_cfg->diasble_wpa2_e) {
     unsigned int ca_pem_bytes = periph_wifi->wpa2_e_cfg->ca_pem_end -
