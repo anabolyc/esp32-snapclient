@@ -22,7 +22,13 @@
 #include <lwip/sockets.h>
 #include "esp_wifi.h"
 
-/* Access player playback state to avoid interrupting active playback */
+/* Access player playback state to avoid interrupting active playback.
+ * WARNING: This extern bool is accessed without synchronization. The player
+ * task may modify it while we read it, creating a TOCTOU race. For now we
+ * accept this as the window is small and consequences are minor (at worst,
+ * takeover happens slightly before/after intended). A proper fix would use
+ * atomic operations or include playerstarted in our semaphore-protected state.
+ */
 extern bool playerstarted;
 
 #if CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
@@ -46,10 +52,11 @@ static bool want_eth_takeover = false;
 // Ethernet mode: 0=Disabled (default), 1=DHCP, 2=Static
 static int32_t current_eth_mode = 0;
 
-/* State guards for static IP application (Fix 3) */
+/* State guards for static IP application */
 static bool static_ip_in_progress = false;
 static bool static_ip_pending = false;
-static esp_netif_t *static_ip_netif = NULL;  // netif for pending static IP
+static esp_netif_t *static_ip_netif = NULL;  // Protected netif pointer for static IP task
+static TaskHandle_t static_ip_task_handle = NULL;  // Track task for cleanup on disconnect
 
 /* Forward declaration for reconnect request */
 extern void app_request_reconnect(void);
@@ -600,7 +607,7 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
 }
 
 /**
- * @brief Background task for static IP configuration (Fix 2)
+ * @brief Background task for static IP configuration
  *
  * Moves blocking static IP operations out of the event handler to prevent
  * blocking other Ethernet events. The task handles:
@@ -609,21 +616,27 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
  * - Gateway reachability check
  * - Takeover coordination
  *
- * @param pvParameters The esp_netif_t* for the Ethernet interface
+ * CRITICAL: Uses static_ip_netif (protected by semaphore) instead of task
+ * parameter to avoid use-after-free if netif is invalidated during delays.
+ *
+ * @param pvParameters Unused (netif obtained from protected static variable)
  */
 static void static_ip_task(void *pvParameters) {
-  esp_netif_t *netif = (esp_netif_t *)pvParameters;
+  (void)pvParameters;  // Unused - we use protected static_ip_netif instead
+  esp_netif_t *netif = NULL;
 
   ESP_LOGI(TAG, "Static IP task started");
 
-  // Check if we should abort (disconnected while waiting to start)
+  // Get netif from protected variable and check if we should abort
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-  if (!static_ip_in_progress) {
-    ESP_LOGW(TAG, "Static IP task: aborted (flag cleared)");
+  if (!static_ip_in_progress || !static_ip_netif) {
+    ESP_LOGW(TAG, "Static IP task: aborted (flag cleared or no netif)");
+    static_ip_task_handle = NULL;
     xSemaphoreGive(connIpSemaphoreHandle);
     vTaskDelete(NULL);
     return;
   }
+  netif = static_ip_netif;
   xSemaphoreGive(connIpSemaphoreHandle);
 
   // Wait for link to stabilize
@@ -631,8 +644,9 @@ static void static_ip_task(void *pvParameters) {
 
   // Check again if we should continue (cable might have been unplugged)
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-  if (!static_ip_in_progress) {
+  if (!static_ip_in_progress || static_ip_netif != netif) {
     ESP_LOGW(TAG, "Static IP task: aborted after link delay");
+    static_ip_task_handle = NULL;
     xSemaphoreGive(connIpSemaphoreHandle);
     vTaskDelete(NULL);
     return;
@@ -648,13 +662,14 @@ static void static_ip_task(void *pvParameters) {
 
     // Check if still valid
     xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-    bool still_valid = static_ip_in_progress && connected;
+    bool still_valid = static_ip_in_progress && connected && (static_ip_netif == netif);
     xSemaphoreGive(connIpSemaphoreHandle);
 
     if (!still_valid) {
       ESP_LOGW(TAG, "Static IP task: aborted after IP apply");
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       static_ip_in_progress = false;
+      static_ip_task_handle = NULL;
       xSemaphoreGive(connIpSemaphoreHandle);
       vTaskDelete(NULL);
       return;
@@ -664,17 +679,25 @@ static void static_ip_task(void *pvParameters) {
     if (!eth_check_gateway_reachable(netif)) {
       ESP_LOGW(TAG, "Static IP failed gateway check, falling back to DHCP");
 
+      // Check if still connected before starting DHCP (prevents race with disconnect)
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      bool still_connected = (static_ip_netif == netif);  // netif still valid
       connected = false;
       static_ip_in_progress = false;
+      static_ip_task_handle = NULL;
       xSemaphoreGive(connIpSemaphoreHandle);
 
-      // Start DHCP - GOT_IP event will handle takeover
-      esp_netif_dhcpc_start(netif);
+      if (still_connected) {
+        // Start DHCP - GOT_IP event will handle takeover
+        esp_netif_dhcpc_start(netif);
+      } else {
+        ESP_LOGW(TAG, "Ethernet disconnected, skipping DHCP fallback");
+      }
     } else {
       // Static IP succeeded - apply takeover using unified checkpoint
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       static_ip_in_progress = false;
+      static_ip_task_handle = NULL;
       xSemaphoreGive(connIpSemaphoreHandle);
 
       eth_check_and_apply_takeover(netif);
@@ -685,6 +708,7 @@ static void static_ip_task(void *pvParameters) {
     ESP_LOGW(TAG, "Static IP configuration failed, using DHCP");
     xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
     static_ip_in_progress = false;
+    static_ip_task_handle = NULL;
     xSemaphoreGive(connIpSemaphoreHandle);
   }
 
@@ -722,26 +746,29 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Ethernet present and WiFi active; will prefer Ethernet after IP acquired");
       }
 
-      // Handle static IP mode (Fix 2: spawn task instead of blocking)
+      // Handle static IP mode (spawn task instead of blocking)
       if (current_eth_mode == 2) {  // Static
         xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
 
-        // Fix 3: Check state guards
-        if (static_ip_in_progress) {
-          ESP_LOGW(TAG, "Static IP already in progress, ignoring duplicate connect event");
-          xSemaphoreGive(connIpSemaphoreHandle);
-          break;
+        // Kill any existing static IP task before starting a new one
+        if (static_ip_task_handle != NULL) {
+          ESP_LOGW(TAG, "Aborting previous static IP task");
+          vTaskDelete(static_ip_task_handle);
+          static_ip_task_handle = NULL;
         }
 
-        // Fix 4: Check if playback is active - defer if so
+        // Check if playback is active - defer if so
         if (playerstarted) {
           ESP_LOGI(TAG, "Playback active; deferring static IP until playback stops");
           static_ip_pending = true;
           static_ip_netif = netif;
+          static_ip_in_progress = false;
           xSemaphoreGive(connIpSemaphoreHandle);
           break;
         }
 
+        // Store netif in protected variable BEFORE creating task
+        static_ip_netif = netif;
         static_ip_in_progress = true;
         static_ip_pending = false;
         xSemaphoreGive(connIpSemaphoreHandle);
@@ -751,17 +778,23 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
             static_ip_task,
             "eth_static_ip",
             4096,
-            (void *)netif,
+            NULL,  // Task uses protected static_ip_netif instead
             5,
-            NULL
+            &static_ip_task_handle
         );
 
         if (task_created != pdPASS) {
           ESP_LOGE(TAG, "Failed to create static IP task, falling back to DHCP");
           xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
           static_ip_in_progress = false;
+          static_ip_netif = NULL;
+          static_ip_task_handle = NULL;
           xSemaphoreGive(connIpSemaphoreHandle);
-          // DHCP will be started by default
+          // Explicitly start DHCP as fallback
+          esp_err_t dhcp_err = esp_netif_dhcpc_start(netif);
+          if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+            ESP_LOGE(TAG, "Failed to start DHCP fallback: %s", esp_err_to_name(dhcp_err));
+          }
         }
       }
       // DHCP mode (current_eth_mode == 1): takeover will be handled in got_ip_event_handler
@@ -771,8 +804,15 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       connected = false;
 
-      // Fix 5: Reset static IP state guards on disconnect
-      static_ip_in_progress = false;  // Abort any running static IP task
+      // Kill any running static IP task immediately
+      if (static_ip_task_handle != NULL) {
+        ESP_LOGI(TAG, "Killing static IP task on disconnect");
+        vTaskDelete(static_ip_task_handle);
+        static_ip_task_handle = NULL;
+      }
+
+      // Reset static IP state guards on disconnect
+      static_ip_in_progress = false;
       static_ip_pending = false;
       static_ip_netif = NULL;
 
@@ -807,21 +847,16 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
   }
 }
 
-/** Event handler for IP_EVENT_ETH_GOT_IP */
+/** Event handler for IP_EVENT_ETH_LOST_IP */
 static void lost_ip_event_handler(void *arg, esp_event_base_t event_base,
                                   int32_t event_id, void *event_data) {
   ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
 
   for (int i = 0; i < eth_port_cnt; i++) {
-    char if_desc_str[10];
-    char num_str[3];
-
-    itoa(i, num_str, 10);
-    strcat(strcpy(if_desc_str, NETWORK_INTERFACE_DESC_ETH), num_str);
+    char if_desc_str[32];  // Larger buffer to prevent overflow
+    snprintf(if_desc_str, sizeof(if_desc_str), "%s%d", NETWORK_INTERFACE_DESC_ETH, i);
 
     if (network_is_our_netif(if_desc_str, event->esp_netif)) {
-      // const esp_netif_ip_info_t *ip_info = &event->ip_info;
-
       ESP_LOGI(TAG, "Ethernet Lost IP Address");
 
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
@@ -841,11 +876,8 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
   ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
 
   for (int i = 0; i < eth_port_cnt; i++) {
-    char if_desc_str[10];
-    char num_str[3];
-
-    itoa(i, num_str, 10);
-    strcat(strcpy(if_desc_str, NETWORK_INTERFACE_DESC_ETH), num_str);
+    char if_desc_str[32];  // Larger buffer to prevent overflow
+    snprintf(if_desc_str, sizeof(if_desc_str), "%s%d", NETWORK_INTERFACE_DESC_ETH, i);
 
     if (network_is_our_netif(if_desc_str, event->esp_netif)) {
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
@@ -918,16 +950,24 @@ void eth_on_playback_stopped(void) {
         static_ip_task,
         "eth_static_ip",
         4096,
-        (void *)pending_netif,
+        NULL,  // Task uses protected static_ip_netif instead
         5,
-        NULL
+        &static_ip_task_handle
     );
 
     if (task_created != pdPASS) {
-      ESP_LOGE(TAG, "Failed to create deferred static IP task");
+      ESP_LOGE(TAG, "Failed to create deferred static IP task, falling back to DHCP");
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       static_ip_in_progress = false;
+      static_ip_task_handle = NULL;
       xSemaphoreGive(connIpSemaphoreHandle);
+      // Explicitly start DHCP as fallback
+      if (pending_netif) {
+        esp_err_t dhcp_err = esp_netif_dhcpc_start(pending_netif);
+        if (dhcp_err != ESP_OK && dhcp_err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+          ESP_LOGE(TAG, "Failed to start DHCP fallback: %s", esp_err_to_name(dhcp_err));
+        }
+      }
     }
     return;
   }
@@ -1032,18 +1072,16 @@ void eth_start(void) {
         ESP_NETIF_INHERENT_DEFAULT_ETH();
     esp_netif_config_t cfg_spi = {.base = &esp_netif_config,
                                   .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH};
-    char if_key_str[10];
-    char if_desc_str[10];
-    char num_str[3];
+    char if_key_str[32];   // Larger buffer to prevent overflow
+    char if_desc_str[32];  // Larger buffer to prevent overflow
 
     // Track created netifs for cleanup on partial failure
     esp_netif_t *created_netifs[SPI_ETHERNETS_NUM + INTERNAL_ETHERNETS_NUM];
     memset(created_netifs, 0, sizeof(created_netifs));
 
     for (int i = 0; i < eth_port_cnt; i++) {
-      itoa(i, num_str, 10);
-      strcat(strcpy(if_key_str, "ETH_"), num_str);
-      strcat(strcpy(if_desc_str, NETWORK_INTERFACE_DESC_ETH), num_str);
+      snprintf(if_key_str, sizeof(if_key_str), "ETH_%d", i);
+      snprintf(if_desc_str, sizeof(if_desc_str), "%s%d", NETWORK_INTERFACE_DESC_ETH, i);
       esp_netif_config.if_key = if_key_str;
       esp_netif_config.if_desc = if_desc_str;
       esp_netif_config.route_prio -= i * 5;
