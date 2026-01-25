@@ -960,8 +960,20 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGE(TAG, "Failed to start DHCP fallback: %s", esp_err_to_name(dhcp_err));
           }
         }
+      } else if (current_eth_mode == 1) {
+        // DHCP mode: explicitly start DHCP client
+        // This is required because we stop DHCP on disconnect, and it doesn't
+        // automatically restart on reconnect - causing "invalid static ip" errors
+        esp_err_t dhcp_err = esp_netif_dhcpc_start(netif);
+        if (dhcp_err == ESP_OK) {
+          ESP_LOGI(TAG, "DHCP client started");
+        } else if (dhcp_err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+          ESP_LOGD(TAG, "DHCP client already running");
+        } else {
+          ESP_LOGE(TAG, "Failed to start DHCP client: %s", esp_err_to_name(dhcp_err));
+        }
+        // Takeover will be handled in got_ip_event_handler when DHCP completes
       }
-      // DHCP mode (current_eth_mode == 1): takeover will be handled in got_ip_event_handler
 
       break;
     case ETHERNET_EVENT_DISCONNECTED:
