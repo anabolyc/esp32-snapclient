@@ -23,11 +23,10 @@
 #include "esp_wifi.h"
 
 /* Access player playback state to avoid interrupting active playback.
- * WARNING: This extern bool is accessed without synchronization. The player
- * task may modify it while we read it, creating a TOCTOU race. For now we
- * accept this as the window is small and consequences are minor (at worst,
- * takeover happens slightly before/after intended). A proper fix would use
- * atomic operations or include playerstarted in our semaphore-protected state.
+ * NOTE: This extern bool is accessed without synchronization, creating a
+ * potential TOCTOU race with the player task. The race window is small and
+ * consequences are minor (at worst, takeover happens slightly before/after
+ * intended). Atomic operations or semaphore protection could eliminate this.
  */
 extern bool playerstarted;
 
@@ -620,8 +619,8 @@ static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
     }
   }
 
-  // Manually update the connection state since esp_netif_set_ip_info()
-  // does NOT trigger IP_EVENT_ETH_GOT_IP
+  // Update connection state explicitly since esp_netif_set_ip_info()
+  // does not trigger IP_EVENT_ETH_GOT_IP
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
   memcpy(&ip_info, &static_ip_info, sizeof(esp_netif_ip_info_t));
   connected = true;
@@ -631,7 +630,7 @@ static esp_err_t eth_apply_static_ip(esp_netif_t *netif) {
 }
 
 /**
- * @brief Unified takeover checkpoint - called from ALL IP acquisition paths (Fix 1)
+ * @brief Unified takeover checkpoint - called from all IP acquisition paths
  *
  * Checks if conditions are met for Ethernet takeover and performs it atomically.
  * This ensures consistent behavior whether IP was acquired via DHCP or static config.
@@ -975,7 +974,7 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 
       xSemaphoreGive(connIpSemaphoreHandle);
 
-      /* Use unified takeover checkpoint (Fix 1) - handles playback check internally */
+      /* Check and apply Ethernet takeover (handles playback check internally) */
       eth_check_and_apply_takeover(event->esp_netif);
 
       break;
@@ -1020,7 +1019,7 @@ void eth_on_playback_stopped(void) {
 
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
 
-  // Fix 4: Check for pending static IP configuration first
+  // Check for pending static IP configuration first (takes priority over takeover)
   if (static_ip_pending && static_ip_netif && !static_ip_in_progress) {
     do_static_ip = true;
     pending_netif = static_ip_netif;
