@@ -22,14 +22,6 @@
 #include <lwip/sockets.h>
 #include "esp_wifi.h"
 
-/* Access player playback state to avoid interrupting active playback.
- * NOTE: This extern bool is accessed without synchronization, creating a
- * potential TOCTOU race with the player task. The race window is small and
- * consequences are minor (at worst, takeover happens slightly before/after
- * intended). Atomic operations or semaphore protection could eliminate this.
- */
-extern bool playerstarted;
-
 #if CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
 #include "driver/spi_master.h"
 #endif
@@ -38,6 +30,11 @@ extern bool playerstarted;
 #include "settings_manager.h"
 
 static const char *TAG = "ETH_IF";
+
+/* ============ Event Bit for Playback Monitor Shutdown ============ */
+/* BIT3 is reserved for eth_interface.c use - see network_interface.c comment */
+#define EVENT_MONITOR_SHUTDOWN_BIT     BIT3
+#define EVENT_PLAYBACK_STOPPED_BIT     BIT2  /* Needed to wait for playback stopped */
 
 /* ============ Timing Constants ============ */
 #define ETH_LINK_STABILIZATION_MS     500   // Wait for link to stabilize after connect
@@ -87,8 +84,106 @@ static bool static_ip_pending = false;
 static esp_netif_t *static_ip_netif = NULL;
 static TaskHandle_t static_ip_task_handle = NULL;
 
-/* Forward declaration for reconnect request */
-extern void app_request_reconnect(void);
+/* Playback monitor task - watches for playback stopped events */
+static TaskHandle_t playback_monitor_task_handle = NULL;
+#define PLAYBACK_MONITOR_TASK_STACK   2048
+#define PLAYBACK_MONITOR_TASK_PRIORITY 4
+
+/* Forward declaration for playback stopped handler */
+static void eth_on_playback_stopped(void);
+
+/**
+ * @brief Stop the playback monitor task gracefully
+ *
+ * Signals the task to exit and waits for it to complete.
+ */
+static void stop_playback_monitor_task(void) {
+    if (playback_monitor_task_handle == NULL) {
+        return;
+    }
+
+    EventGroupHandle_t event_group = network_get_event_group();
+    if (event_group) {
+        // Signal task to shutdown
+        xEventGroupSetBits(event_group, EVENT_MONITOR_SHUTDOWN_BIT);
+
+        // Wait for task to exit (with timeout)
+        for (int i = 0; i < 50 && playback_monitor_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Clear the shutdown bit for next time
+        xEventGroupClearBits(event_group, EVENT_MONITOR_SHUTDOWN_BIT);
+    }
+
+    // Force delete if still running (shouldn't happen)
+    if (playback_monitor_task_handle != NULL) {
+        ESP_LOGW(TAG, "Force deleting playback monitor task");
+        vTaskDelete(playback_monitor_task_handle);
+        playback_monitor_task_handle = NULL;
+    }
+}
+
+/**
+ * @brief Task that monitors playback events and triggers pending operations
+ *
+ * This task waits for playback to start, then waits for it to stop, and
+ * calls eth_on_playback_stopped() to process any deferred operations like
+ * static IP configuration or Ethernet takeover.
+ *
+ * The task exits gracefully when EVENT_MONITOR_SHUTDOWN_BIT is set.
+ */
+static void playback_monitor_task(void *pvParameters) {
+    EventGroupHandle_t event_group = network_get_event_group();
+    if (event_group == NULL) {
+        ESP_LOGE(TAG, "Playback monitor: event group not initialized");
+        playback_monitor_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Playback monitor task started");
+
+    /* Define the bits we need to watch - PLAYBACK_STARTED (BIT1) is in network_interface.c */
+    const EventBits_t PLAYBACK_STARTED_BIT = BIT1;
+
+    while (1) {
+        // Wait for playback to start OR shutdown signal
+        EventBits_t bits = xEventGroupWaitBits(event_group,
+                           PLAYBACK_STARTED_BIT | EVENT_MONITOR_SHUTDOWN_BIT,
+                           pdFALSE,  // Don't clear on exit
+                           pdFALSE,  // Don't wait for all bits
+                           portMAX_DELAY);
+
+        if (bits & EVENT_MONITOR_SHUTDOWN_BIT) {
+            ESP_LOGI(TAG, "Playback monitor: shutdown requested");
+            break;
+        }
+
+        ESP_LOGD(TAG, "Playback monitor: playback started, waiting for stop...");
+
+        // Wait for playback to stop OR shutdown signal
+        bits = xEventGroupWaitBits(event_group,
+                           EVENT_PLAYBACK_STOPPED_BIT | EVENT_MONITOR_SHUTDOWN_BIT,
+                           pdFALSE,  // Don't clear on exit
+                           pdFALSE,  // Don't wait for all bits
+                           portMAX_DELAY);
+
+        if (bits & EVENT_MONITOR_SHUTDOWN_BIT) {
+            ESP_LOGI(TAG, "Playback monitor: shutdown requested");
+            break;
+        }
+
+        ESP_LOGD(TAG, "Playback monitor: playback stopped, processing pending operations...");
+
+        // Process any pending operations (deferred takeover or static IP)
+        eth_on_playback_stopped();
+    }
+
+    ESP_LOGI(TAG, "Playback monitor task exiting");
+    playback_monitor_task_handle = NULL;
+    vTaskDelete(NULL);
+}
 
 /**
  * @brief Cleanup Ethernet drivers and free handles on initialization failure
@@ -641,7 +736,7 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
   bool do_takeover = false;
 
   xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
-  if (want_eth_takeover && !we_changed_default_netif && !playerstarted) {
+  if (want_eth_takeover && !we_changed_default_netif && !network_is_playback_active()) {
     do_takeover = true;
     want_eth_takeover = false;
     // Don't set we_changed_default_netif until after successful netif change
@@ -655,7 +750,9 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
       xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
       we_changed_default_netif = true;
       xSemaphoreGive(connIpSemaphoreHandle);
-      app_request_reconnect();
+      if (network_request_reconnect() != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to request reconnect after takeover");
+      }
     } else {
       ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
       // Restore takeover intent so it can be retried
@@ -663,7 +760,7 @@ static void eth_check_and_apply_takeover(esp_netif_t *netif) {
       want_eth_takeover = true;
       xSemaphoreGive(connIpSemaphoreHandle);
     }
-  } else if (want_eth_takeover && playerstarted) {
+  } else if (want_eth_takeover && network_is_playback_active()) {
     ESP_LOGI(TAG, "Playback active; deferring Ethernet takeover until playback stops");
   }
 }
@@ -825,7 +922,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         }
 
         // Check if playback is active - defer if so
-        if (playerstarted) {
+        if (network_is_playback_active()) {
           ESP_LOGI(TAG, "Playback active; deferring static IP until playback stops");
           static_ip_pending = true;
           static_ip_netif = netif;
@@ -903,7 +1000,9 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         want_eth_takeover = false;  // Clear intent - we completed takeover and now falling back
         xSemaphoreGive(connIpSemaphoreHandle);
         /* Request reconnect so main re-evaluates network and uses WiFi */
-        app_request_reconnect();
+        if (network_request_reconnect() != ESP_OK) {
+          ESP_LOGW(TAG, "Failed to request reconnect for WiFi fallback");
+        }
       } else {
         /* Preserve want_eth_takeover on brief disconnect - if Ethernet reconnects
          * quickly, we still want to complete the takeover. Only clear if we
@@ -1003,10 +1102,14 @@ bool eth_get_ip(esp_netif_ip_info_t *ip) {
   return _connected;
 }
 
-/* Called by player code when playback stops so we can complete a pending
- * Ethernet takeover that was delayed during active playback.
+/**
+ * @brief Handle playback stopped event
+ *
+ * Called by playback_monitor_task when playback stops. Completes any pending
+ * Ethernet takeover or deferred static IP configuration that was delayed
+ * during active playback.
  */
-void eth_on_playback_stopped(void) {
+static void eth_on_playback_stopped(void) {
   // Defensive check - semaphore should be created in eth_start()
   if (!connIpSemaphoreHandle) {
     ESP_LOGD(TAG, "eth_on_playback_stopped: semaphore not initialized (Ethernet disabled?)");
@@ -1073,12 +1176,22 @@ void eth_on_playback_stopped(void) {
         xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
         we_changed_default_netif = true;
         xSemaphoreGive(connIpSemaphoreHandle);
-        app_request_reconnect();
+        if (network_request_reconnect() != ESP_OK) {
+          ESP_LOGW(TAG, "Failed to request reconnect after deferred takeover");
+        }
       } else {
         ESP_LOGE(TAG, "Failed to set default netif: %s", esp_err_to_name(err));
+        // Restore takeover intent so it can be retried
+        xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+        want_eth_takeover = true;
+        xSemaphoreGive(connIpSemaphoreHandle);
       }
     } else {
       ESP_LOGW(TAG, "Playback-stopped takeover: ETH netif not found");
+      // Restore takeover intent so it can be retried when netif becomes available
+      xSemaphoreTake(connIpSemaphoreHandle, portMAX_DELAY);
+      want_eth_takeover = true;
+      xSemaphoreGive(connIpSemaphoreHandle);
     }
   }
 }
@@ -1261,6 +1374,35 @@ void eth_start(void) {
     }
   }
 
+  // Start playback monitor task to handle deferred operations when playback stops
+  if (playback_monitor_task_handle == NULL) {
+    BaseType_t task_created = xTaskCreate(
+        playback_monitor_task,
+        "eth_playback_mon",
+        PLAYBACK_MONITOR_TASK_STACK,
+        NULL,
+        PLAYBACK_MONITOR_TASK_PRIORITY,
+        &playback_monitor_task_handle
+    );
+    if (task_created != pdPASS) {
+      ESP_LOGW(TAG, "Failed to create playback monitor task (deferred operations may not work)");
+    }
+  }
+
   ESP_LOGI(TAG, "Ethernet initialization complete");
 #endif
+}
+
+/**
+ * @brief Stop Ethernet and cleanup resources
+ *
+ * Stops the playback monitor task and cleans up Ethernet-related resources.
+ * Call this before network_events_deinit() if shutting down.
+ */
+void eth_stop(void) {
+    // Stop the playback monitor task first
+    stop_playback_monitor_task();
+
+    // Additional cleanup can be added here as needed
+    ESP_LOGI(TAG, "Ethernet stopped");
 }

@@ -31,11 +31,7 @@
 #include "driver/i2s_std.h"
 #include "player.h"
 #include "snapcast.h"
-/* avoid header include-path issues; declare the hook we call when playback stops */
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
-    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-extern void eth_on_playback_stopped(void);
-#endif
+#include "network_interface.h"
 
 #define USE_SAMPLE_INSERTION CONFIG_USE_SAMPLE_INSERTION
 
@@ -491,6 +487,9 @@ int start_player(snapcastSetting_t *setting) {
         return -1;
     }
     playerstarted = true;
+    if (network_playback_started() != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to signal playback started to network layer");
+    }
   int ret = 0;
 
   ret = player_setup_i2s(setting);
@@ -2000,10 +1999,9 @@ static void player_task(void *pvParameters) {
   /* Notify network layer that playback stopped so pending Ethernet takeover
    * can proceed if one was waiting.
    */
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
-    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-  eth_on_playback_stopped();
-#endif
+  if (network_playback_stopped() != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to signal playback stopped to network layer");
+  }
   ESP_LOGI(TAG, "stop player done");
   playerTaskHandle = NULL;
   vTaskDelete(NULL);

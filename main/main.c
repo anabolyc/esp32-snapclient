@@ -100,18 +100,6 @@ struct timeval tdif, tavg;
 /* Logging tag */
 static const char *TAG = "SC";
 
-/* If set to true by external modules, main will restart the connection
- * loop on the next opportunity.
- */
-volatile bool reconnect_requested = false;
-
-/* Called by other modules to request the snapclient reconnect to the
- * server (useful when the preferred network interface changes).
- */
-void app_request_reconnect(void) {
-  reconnect_requested = true;
-  ESP_LOGI(TAG, "app_request_reconnect(): reconnect requested by external module");
-}
 
 // static QueueHandle_t playerChunkQueueHandle = NULL;
 SemaphoreHandle_t timeSyncSemaphoreHandle = NULL;
@@ -589,8 +577,7 @@ static void http_get_task(void *pvParameters) {
       // netconn immediately and restart the loop so we re-evaluate the
       // preferred network interface. This makes reconnects observable in
       // the logs and reduces the time to rebind to the new default netif.
-      if (reconnect_requested) {
-        reconnect_requested = false;
+      if (network_check_and_clear_reconnect()) {
         if (lwipNetconn != NULL) {
           ESP_LOGI(TAG, "Reconnect requested: closing existing netconn (loop start)");
           netconn_close(lwipNetconn);
@@ -818,10 +805,8 @@ network_selected:
       continue;
     }
 
-    // allow external modules to request a reconnect (set by app_request_reconnect())
-    extern volatile bool reconnect_requested;
-    if (reconnect_requested) {
-      reconnect_requested = false;
+    // allow external modules to request a reconnect via network_events
+    if (network_check_and_clear_reconnect()) {
       if (lwipNetconn != NULL) {
         netconn_close(lwipNetconn);
         netconn_delete(lwipNetconn);
@@ -952,8 +937,7 @@ network_selected:
 
     while (1) {
       // Check if external module requested reconnect (e.g., ethernet takeover)
-      if (reconnect_requested) {
-        reconnect_requested = false;  // Clear flag here since goto skips the normal clear path
+      if (network_check_and_clear_reconnect()) {
         ESP_LOGI(TAG, "Reconnect requested during receive loop, breaking out");
         netconn_close(lwipNetconn);
         netconn_delete(lwipNetconn);
@@ -2906,6 +2890,9 @@ void app_main(void) {
 
   // Initialize settings manager (hostname + snapserver settings)
   settings_manager_init();
+
+  // Initialize network events (must be before network_if_init)
+  network_events_init();
 
   // Initialize network interfaces (reads settings during startup)
   network_if_init();

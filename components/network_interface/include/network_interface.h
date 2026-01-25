@@ -10,7 +10,10 @@
 
 #include <stdbool.h>
 
+#include "esp_err.h"
 #include "esp_netif.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 
 #define NETWORK_INTERFACE_DESC_STA "sta"
 #define NETWORK_INTERFACE_DESC_ETH \
@@ -28,13 +31,44 @@ bool network_has_ip(esp_netif_t *esp_netif);
 bool network_is_our_netif(const char *prefix, esp_netif_t *netif);
 void network_if_init(void);
 
-/* Called by player code when playback stops so the network layer can
- * complete any pending Ethernet takeover (stop WiFi) that was delayed
- * while playback was active.
- */
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
-    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-void eth_on_playback_stopped(void);
+#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
+/** Stop Ethernet and cleanup resources */
+void eth_stop(void);
 #endif
+
+/*
+ * Inter-component coordination via FreeRTOS EventGroups.
+ * Used for reconnect requests and playback state signaling.
+ *
+ * Initialization order: Call network_events_init() before network_if_init()
+ * and before any playback or reconnect functions are used.
+ */
+
+/** Initialize network event group (call early in startup) */
+void network_events_init(void);
+
+/** Get event group handle (for internal use by eth_interface) */
+EventGroupHandle_t network_get_event_group(void);
+
+/** Cleanup network event group (call on shutdown if needed) */
+void network_events_deinit(void);
+
+/** Request a reconnect to the server (thread-safe)
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized */
+esp_err_t network_request_reconnect(void);
+
+/** Check and clear reconnect request (thread-safe, returns true if requested) */
+bool network_check_and_clear_reconnect(void);
+
+/** Signal that playback has started (thread-safe)
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized */
+esp_err_t network_playback_started(void);
+
+/** Signal that playback has stopped (thread-safe)
+ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized */
+esp_err_t network_playback_stopped(void);
+
+/** Check if playback is currently active (thread-safe) */
+bool network_is_playback_active(void);
 
 #endif /* COMPONENTS_NETWORK_INTERFACE_INCLUDE_NETWORK_INTERFACE_H_ */
