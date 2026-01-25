@@ -2017,6 +2017,10 @@ static void player_task(void *pvParameters) {
       ESP_LOGW(TAG, "Failed to signal playback stopped to network layer");
   }
   ESP_LOGI(TAG, "stop player done");
+
+  // Cleanup complete - clear shutdown flag so player can restart
+  player_shutdown_in_progress = false;
+
   playerTaskHandle = NULL;
   vTaskDelete(NULL);
 }
