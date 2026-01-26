@@ -94,38 +94,6 @@ static TaskHandle_t playback_monitor_task_handle = NULL;
 static void eth_on_playback_stopped(void);
 
 /**
- * @brief Stop the playback monitor task gracefully
- *
- * Signals the task to exit and waits for it to complete.
- */
-static void stop_playback_monitor_task(void) {
-    if (playback_monitor_task_handle == NULL) {
-        return;
-    }
-
-    EventGroupHandle_t event_group = network_get_event_group();
-    if (event_group) {
-        // Signal task to shutdown
-        xEventGroupSetBits(event_group, EVENT_MONITOR_SHUTDOWN_BIT);
-
-        // Wait for task to exit (with timeout)
-        for (int i = 0; i < 50 && playback_monitor_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-
-        // Clear the shutdown bit for next time
-        xEventGroupClearBits(event_group, EVENT_MONITOR_SHUTDOWN_BIT);
-    }
-
-    // Force delete if still running (shouldn't happen)
-    if (playback_monitor_task_handle != NULL) {
-        ESP_LOGW(TAG, "Force deleting playback monitor task");
-        vTaskDelete(playback_monitor_task_handle);
-        playback_monitor_task_handle = NULL;
-    }
-}
-
-/**
  * @brief Task that monitors playback events and triggers pending operations
  *
  * This task waits for playback to start, then waits for it to stop, and
