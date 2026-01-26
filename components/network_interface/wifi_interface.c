@@ -20,6 +20,9 @@
 #include "freertos/semphr.h"
 #include "network_interface.h"
 #include "nvs_flash.h"
+
+/* Internal function from network_interface.c (not part of public API) */
+extern bool network_is_our_netif(const char *prefix, esp_netif_t *netif);
 #include "sdkconfig.h"
 
 #if ENABLE_WIFI_PROVISIONING

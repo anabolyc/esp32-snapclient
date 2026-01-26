@@ -12,8 +12,6 @@
 
 #include "esp_err.h"
 #include "esp_netif.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 
 #define NETWORK_INTERFACE_DESC_STA "sta"
 #define NETWORK_INTERFACE_DESC_ETH \
@@ -23,12 +21,19 @@
 
 extern char *ipv6_addr_types_to_str[6];
 
+/** Get netif by description string */
 esp_netif_t *network_get_netif_from_desc(const char *desc);
+
+/** Get interface key string */
 const char *network_get_ifkey(esp_netif_t *esp_netif);
-bool network_if_get_ip(esp_netif_ip_info_t *ip);
+
+/** Check if netif is up */
 bool network_is_netif_up(esp_netif_t *esp_netif);
+
+/** Check if netif has a valid IP address */
 bool network_has_ip(esp_netif_t *esp_netif);
-bool network_is_our_netif(const char *prefix, esp_netif_t *netif);
+
+/** Initialize network interfaces (WiFi and/or Ethernet) */
 void network_if_init(void);
 
 /*
@@ -42,16 +47,6 @@ void network_if_init(void);
 /** Initialize network event group (call early in startup) */
 void network_events_init(void);
 
-/** Get event group handle (for internal use by eth_interface) */
-EventGroupHandle_t network_get_event_group(void);
-
-/** Cleanup network event group (call on shutdown if needed) */
-void network_events_deinit(void);
-
-/** Request a reconnect to the server (thread-safe)
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized */
-esp_err_t network_request_reconnect(void);
-
 /** Check and clear reconnect request (thread-safe, returns true if requested) */
 bool network_check_and_clear_reconnect(void);
 
@@ -62,8 +57,5 @@ esp_err_t network_playback_started(void);
 /** Signal that playback has stopped (thread-safe)
  * @return ESP_OK on success, ESP_ERR_INVALID_STATE if not initialized */
 esp_err_t network_playback_stopped(void);
-
-/** Check if playback is currently active (thread-safe) */
-bool network_is_playback_active(void);
 
 #endif /* COMPONENTS_NETWORK_INTERFACE_INCLUDE_NETWORK_INTERFACE_H_ */
