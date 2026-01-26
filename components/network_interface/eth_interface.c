@@ -27,13 +27,8 @@
 #endif
 
 #include "network_interface.h"
+#include "network_interface_priv.h"
 #include "settings_manager.h"
-
-/* Internal functions from network_interface.c (not part of public API) */
-extern EventGroupHandle_t network_get_event_group(void);
-extern esp_err_t network_request_reconnect(void);
-extern bool network_is_playback_active(void);
-extern bool network_is_our_netif(const char *prefix, esp_netif_t *netif);
 
 static const char *TAG = "ETH_IF";
 
