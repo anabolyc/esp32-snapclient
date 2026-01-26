@@ -7,4 +7,5 @@ endif()
 
 idf_component_register(SRCS ${SRCS}
                        INCLUDE_DIRS "include"
+                       PRIV_INCLUDE_DIRS "priv_include"
                        PRIV_REQUIRES driver esp_wifi esp_eth esp_netif esp_timer nvs_flash improv_wifi settings_manager lwip)
