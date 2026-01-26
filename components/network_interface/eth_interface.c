@@ -1406,16 +1406,3 @@ void eth_start(void) {
 #endif
 }
 
-/**
- * @brief Stop Ethernet and cleanup resources (internal use only)
- *
- * Stops the playback monitor task and cleans up Ethernet-related resources.
- * Call this before network_events_deinit() if shutting down.
- */
-static void eth_stop(void) {
-    // Stop the playback monitor task first
-    stop_playback_monitor_task();
-
-    // Additional cleanup can be added here as needed
-    ESP_LOGI(TAG, "Ethernet stopped");
-}
