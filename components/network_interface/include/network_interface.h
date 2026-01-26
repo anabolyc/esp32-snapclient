@@ -31,11 +31,6 @@ bool network_has_ip(esp_netif_t *esp_netif);
 bool network_is_our_netif(const char *prefix, esp_netif_t *netif);
 void network_if_init(void);
 
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
-/** Stop Ethernet and cleanup resources */
-void eth_stop(void);
-#endif
-
 /*
  * Inter-component coordination via FreeRTOS EventGroups.
  * Used for reconnect requests and playback state signaling.
